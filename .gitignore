@@ -1,0 +1,8 @@
+/target/
+/.env
+/data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+*.sqlite.owner.lock

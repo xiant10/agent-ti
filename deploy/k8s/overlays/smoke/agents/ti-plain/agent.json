@@ -1,0 +1,13 @@
+{
+  "agent": "ti-plain",
+  "models": {
+    "chat": {
+      "provider": "openai-compatible",
+      "modelId": "scripted",
+      "baseUrl": "${FIXTURE_URL:-http://agent-ti-fixture:8080}/v1",
+      "identityHeaders": "gateway"
+    }
+  },
+  "profiles": { "chat": { "model": "chat", "maxActiveTools": 0 } },
+  "instructions": [{ "name": "base", "file": "base.md", "tag": false }]
+}

@@ -1,0 +1,7 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: t10
+resources: [../../base]
+images:
+  - name: t10/agent-ti
+    newTag: picker

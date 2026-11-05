@@ -1,0 +1,1 @@
+ALTER TABLE commands ADD COLUMN when_busy TEXT NOT NULL DEFAULT 'queue';

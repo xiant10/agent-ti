@@ -1,0 +1,17 @@
+{
+  "port": "${PORT:-18120}",
+  "instanceId": "agent-ti-0",
+  "logLevel": "${LOG_LEVEL:-info}",
+  "storage": { "kind": "sqlite", "dir": "${AGENT_DATA_DIR:-/data}" },
+  "auth": {
+    "algorithms": "ES256",
+    "jwksUrl": "${FIXTURE_URL:-http://agent-ti-fixture:8080}/jwks",
+    "issuer": "agent-ti-fixture",
+    "audience": "t10",
+    "tenantClaim": "tid",
+    "requiredScopes": "agent:use"
+  },
+  "limits": { "maxConcurrentRuns": 8, "maxStreams": 64 },
+  "agents": "${AGENTS_DIR:-/etc/agent-ti/agents}/ti-demo/agent.json, ${AGENTS_DIR:-/etc/agent-ti/agents}/ti-plain/agent.json",
+  "defaultAgent": "ti-demo"
+}

@@ -1,0 +1,28 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: agent-ti-test
+resources: [../../base, namespace.yaml, fixture.yaml]
+configMapGenerator:
+  - name: agent-ti-host
+    behavior: replace
+    files: [agent-ti.json]
+  - name: agent-ti-agent-ti
+    behavior: replace
+    files: [agents/ti-demo/agent.json, agents/ti-demo/base.md, agents/ti-demo/context.md, agents/ti-demo/faq.json]
+  - name: agent-ti-agent-ti-plain
+    files: [agents/ti-plain/agent.json, agents/ti-plain/base.md]
+  - name: agent-ti-fixture
+    files: [fixture.mjs]
+patches:
+  - target: {kind: StatefulSet, name: agent-ti}
+    patch: |-
+      - {op: replace, path: /spec/template/spec/containers/0/envFrom, value: []}
+      - op: replace
+        path: /spec/template/spec/containers/0/volumeMounts/2
+        value: {name: agent-ti, mountPath: /etc/agent-ti/agents/ti-demo, readOnly: true}
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts/-
+        value: {name: agent-ti-plain, mountPath: /etc/agent-ti/agents/ti-plain, readOnly: true}
+      - op: add
+        path: /spec/template/spec/volumes/-
+        value: {name: agent-ti-plain, configMap: {name: agent-ti-agent-ti-plain}}

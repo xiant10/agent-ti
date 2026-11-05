@@ -1,0 +1,11 @@
+//! agent-pi in Rust: transport, auth, plugins and the session worker. Configuration is read only
+//! through `agent-ti-config`'s config sources.
+pub mod adapters;
+pub mod agents;
+pub mod auth;
+pub mod catalog;
+pub mod events;
+pub mod grants;
+pub mod plugins;
+pub mod server;
+pub mod worker;

@@ -1,0 +1,21 @@
+{
+  "agent": "ti",
+  "bundle": "${AGENT_BUNDLE:-}",
+  "models": {
+    "chat": {
+      "provider": "openai-compatible",
+      "providerId": "gateway",
+      "modelId": "${CHAT_MODEL_ID:-qwen3.5-flash}",
+      "baseUrl": "${LLM_BASE_URL:-http://ai-gateway-llm.t10.svc.cluster.local:18080/v1}",
+      "apiKeyEnv": "LLM_API_KEY",
+      "contextWindow": 128000,
+      "maxOutputTokens": 2048,
+      "identityHeaders": "gateway"
+    }
+  },
+  "defaultProfile": "chat",
+  "profiles": { "chat": { "model": "chat", "thinkingLevel": "off", "maxActiveTools": 0 } },
+  "instructions": [{ "name": "base", "file": "base.md", "tag": false }],
+  "limits": { "maxSessionsPerUser": 1000, "maxConcurrentRunsPerUser": 20, "maxToolRounds": 12 },
+  "durable": { "stream": { "timeoutMs": 120000 } }
+}

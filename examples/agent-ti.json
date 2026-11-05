@@ -1,0 +1,14 @@
+{
+  "port": "${PORT:-18120}",
+  "logLevel": "${LOG_LEVEL:-info}",
+  "storage": { "kind": "sqlite", "dir": "${AGENT_DATA_DIR:-../data}" },
+  "auth": {
+    "algorithms": "${JWT_ALGORITHMS:-RS256,ES256}",
+    "jwksUrl": "${JWT_JWKS_URL:-http://localhost:18000/.well-known/jwks.json}",
+    "issuer": "${JWT_ISSUER:-http://localhost:18000}",
+    "audience": "${JWT_AUDIENCE:-t10}",
+    "requiredScopes": "${JWT_REQUIRED_SCOPES:-agent:use}",
+    "tenantClaim": "tid"
+  },
+  "agents": "${AGENT_CONFIG:-../../agent-pi/apps/assistant/config/agent.json}"
+}

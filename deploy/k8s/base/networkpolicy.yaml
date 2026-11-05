@@ -1,0 +1,13 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: agent-ti}
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: agent-ti}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app.kubernetes.io/name: ai-gateway-agent}}
+        - podSelector: {matchLabels: {app.kubernetes.io/name: t10-agent-control}}
+        - podSelector: {matchLabels: {app.kubernetes.io/name: agent-ti-test}}
+      ports: [{port: 18120, protocol: TCP}]

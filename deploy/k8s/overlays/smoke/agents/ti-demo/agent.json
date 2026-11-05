@@ -1,0 +1,27 @@
+{
+  "agent": "ti-demo",
+  "models": {
+    "chat": {
+      "provider": "openai-compatible",
+      "modelId": "scripted",
+      "baseUrl": "${FIXTURE_URL:-http://agent-ti-fixture:8080}/v1",
+      "contextWindow": 32000,
+      "maxOutputTokens": 2048,
+      "identityHeaders": "gateway"
+    }
+  },
+  "defaultProfile": "chat",
+  "profiles": { "chat": { "model": "chat", "maxActiveTools": 4, "alwaysOnTools": ["tools:*"] } },
+  "instructions": [
+    { "name": "base", "file": "base.md", "tag": false },
+    { "name": "context", "file": "context.md" }
+  ],
+  "plugins": [
+    { "use": "guardrails" },
+    { "use": "shortcuts", "options": { "faqFile": "faq.json", "assistantName": "Agent Ti" } },
+    { "use": "audit" }
+  ],
+  "mcpServers": [{ "name": "tools", "transport": "http", "url": "${FIXTURE_URL:-http://agent-ti-fixture:8080}/mcp" }],
+  "limits": { "maxSessionsPerUser": 100, "maxConcurrentRunsPerUser": 8, "maxToolRounds": 4 },
+  "durable": { "stream": { "timeoutMs": 30000 }, "restartLimit": 3 }
+}

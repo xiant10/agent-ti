@@ -1,0 +1,58 @@
+[package]
+name = "agent-ti"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+members = [".", "crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+agent-ti-config = { path = "crates/agent-ti-config" }
+agent-ti-core = { path = "crates/agent-ti-core" }
+agent-ti-plugin-sdk = { path = "crates/agent-ti-plugin-sdk" }
+agent-ti-store = { path = "crates/agent-ti-store" }
+
+[dependencies]
+agent-ti-config.workspace = true
+agent-ti-core.workspace = true
+agent-ti-plugin-sdk.workspace = true
+agent-ti-store.workspace = true
+jsonschema = { version = "0.33", default-features = false }
+axum = { version = "0.8", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+jsonwebtoken = "9"
+async-stream = "0.3"
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tokio-util = "0.7"
+regex = "1"
+jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+sqlx.workspace = true
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[lints]
+workspace = true

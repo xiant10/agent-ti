@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: agent-ti-fixture}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: agent-ti-fixture}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: agent-ti-fixture}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: fixture
+          image: node:24.21.0-bookworm-slim
+          command: [node, /fixture/fixture.mjs]
+          ports: [{name: http, containerPort: 8080}]
+          resources:
+            requests: {cpu: 25m, memory: 32Mi}
+            limits: {cpu: 500m, memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+          volumeMounts:
+            - {name: fixture, mountPath: /fixture, readOnly: true}
+      volumes:
+        - name: fixture
+          configMap: {name: agent-ti-fixture}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: agent-ti-fixture}
+spec:
+  selector: {app.kubernetes.io/name: agent-ti-fixture}
+  ports: [{name: http, port: 8080, targetPort: http}]
