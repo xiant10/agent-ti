@@ -524,12 +524,12 @@ async fn test_mcp_sse_list_changed() {
     let client = reqwest::Client::new();
 
     // 1. Initial tools list: empty because server hasn't been listed yet
-    let initial_tools = agent.match_tools(&["*".into()], "default");
+    let initial_tools = agent.match_tools(&["*".into()], "default").await;
     assert!(initial_tools.is_empty());
 
     // Relist server initially
     agent.relist_server(0, &client).await;
-    let loaded_tools = agent.match_tools(&["*".into()], "default");
+    let loaded_tools = agent.match_tools(&["*".into()], "default").await;
     assert_eq!(loaded_tools, vec!["collab_query"]);
 
     // 2. Bump server tools version to 2 (which offers collab_query AND collab_update)
@@ -542,7 +542,7 @@ async fn test_mcp_sse_list_changed() {
     let mut updated = false;
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let tools = agent.match_tools(&["*".into()], "default");
+        let tools = agent.match_tools(&["*".into()], "default").await;
         if tools.contains(&"collab_update".to_string()) {
             updated = true;
             break;
@@ -553,7 +553,7 @@ async fn test_mcp_sse_list_changed() {
         "Dynamic tool re-listing should have been triggered by list_changed SSE event"
     );
 
-    let tools = agent.match_tools(&["*".into()], "default");
+    let tools = agent.match_tools(&["*".into()], "default").await;
     assert!(tools.contains(&"collab_query".to_string()));
     assert!(tools.contains(&"collab_update".to_string()));
 }

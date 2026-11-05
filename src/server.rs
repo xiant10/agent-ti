@@ -385,20 +385,34 @@ async fn prompt(
             }
         }
     }
-    let profile_name = agent
-        .store
-        .state(&s, session_id)
-        .await
-        .map(|st| st.session.profile)
-        .map_err(storage)?;
+    let session_state = agent.store.state(&s, session_id).await.map_err(storage)?;
+    let skill_draft = session_state
+        .session
+        .metadata
+        .get("skillDraft")
+        .and_then(Value::as_str);
+
+    let turn_skills = if let Some(ref ts) = agent.tenant_skills {
+        if let Some(draft_name) = skill_draft.filter(|n| !n.is_empty()) {
+            ts.with_draft(Some(&s.tenant_id), &s.user_id, draft_name)
+                .await
+        } else {
+            ts.for_tenant(Some(&s.tenant_id)).await
+        }
+    } else {
+        Arc::new(agent.config.skills.clone())
+    };
+    agent.turn_pins.pin(session_id, turn_skills.clone()).await;
+
+    let profile_name = session_state.session.profile;
     if let Some(prof) = agent.config.profiles.get(&profile_name) {
-        let pinned = agent.pinned_tools(&s.tenant_id, prof);
+        let pinned = agent.pinned_tools(&s.tenant_id, prof).await;
         let policy = agent_ti_store::ActivationPolicy {
             pinned,
             max_active: prof.max_active_tools as usize,
         };
         if !plugin_tools.is_empty() {
-            let matched = agent.match_tools(&plugin_tools, &s.tenant_id);
+            let matched = agent.match_tools(&plugin_tools, &s.tenant_id).await;
             if !matched.is_empty() {
                 let _ = agent
                     .store
@@ -407,7 +421,7 @@ async fn prompt(
             }
         }
         if prof.preload_max_tools > 0 {
-            let preloaded = agent.preload_tools(&text, prof, &s.tenant_id);
+            let preloaded = agent.preload_tools(&text, prof, &s.tenant_id).await;
             if !preloaded.is_empty() {
                 let _ = agent
                     .store
@@ -421,12 +435,10 @@ async fn prompt(
                 &s,
                 session_id,
                 |skill_name| {
-                    agent
-                        .config
-                        .skills
+                    turn_skills
                         .iter()
                         .find(|sk| sk.name == skill_name)
-                        .map(|sk| agent.match_tools(&sk.tools, &s.tenant_id))
+                        .map(|sk| agent.match_tools_sync(&sk.tools, &s.tenant_id))
                 },
                 &policy,
             )
@@ -502,16 +514,30 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
     match r.method.as_str() {
         "agents.list" => return ok(r.id, json!({"agents":[{"name":agent.name}]}), None),
         "skills.list" => {
-            let skills: Vec<Value> = agent
-                .config
-                .skills
+            let skills_view = if let Some(ref ts) = agent.tenant_skills {
+                ts.for_tenant(Some(&s.tenant_id)).await
+            } else {
+                Arc::new(agent.config.skills.clone())
+            };
+            let skills: Vec<Value> = skills_view
                 .iter()
                 .map(|s| {
-                    json!({
+                    let mut val = json!({
                         "name": s.name,
                         "description": s.description,
                         "tools": s.tools,
-                    })
+                    });
+                    if let Some(ref flow) = s.flow {
+                        val["flow"] = flow.clone();
+                    }
+                    if let Some(ref source) = s.source {
+                        val["source"] = json!({
+                            "kind": source.kind,
+                            "version": source.version,
+                            "digest": source.digest,
+                        });
+                    }
+                    val
                 })
                 .collect();
             return ok(r.id, json!({ "skills": skills }), None);
@@ -521,7 +547,12 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
                 Some(name) if !name.is_empty() => name,
                 _ => return fail(StatusCode::BAD_REQUEST, "skill must be a non-empty string"),
             };
-            let skill = match agent.config.skills.iter().find(|s| s.name == skill_name) {
+            let skills_view = if let Some(ref ts) = agent.tenant_skills {
+                ts.for_tenant(Some(&s.tenant_id)).await
+            } else {
+                Arc::new(agent.config.skills.clone())
+            };
+            let skill = match skills_view.iter().find(|s| s.name == skill_name) {
                 Some(s) => s,
                 None => {
                     return fail(
@@ -531,23 +562,34 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
                 }
             };
             let files: Vec<String> = skill.files.keys().cloned().collect();
+            let mut skill_val = json!({
+                "name": skill.name,
+                "description": skill.description,
+                "tools": skill.tools,
+                "keywords": skill.keywords,
+                "body": skill.body,
+                "files": files,
+            });
+            if let Some(ref flow) = skill.flow {
+                skill_val["flow"] = flow.clone();
+            }
+            if let Some(ref source) = skill.source {
+                skill_val["source"] = json!({
+                    "kind": source.kind,
+                    "version": source.version,
+                    "digest": source.digest,
+                });
+            }
             return ok(
                 r.id,
                 json!({
-                    "skill": {
-                        "name": skill.name,
-                        "description": skill.description,
-                        "tools": skill.tools,
-                        "keywords": skill.keywords,
-                        "body": skill.body,
-                        "files": files,
-                    }
+                    "skill": skill_val
                 }),
                 None,
             );
         }
         "skills.tools" => {
-            let tools = agent.catalog_tools(&s.tenant_id);
+            let tools = agent.catalog_tools(&s.tenant_id).await;
             let result: Vec<Value> = tools
                 .into_iter()
                 .map(|t| {
@@ -615,7 +657,7 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
                             }
                         }
                         if let Some(profile_cfg) = agent.config.profiles.get(&session.profile) {
-                            let pinned = agent.pinned_tools(&s.tenant_id, profile_cfg);
+                            let pinned = agent.pinned_tools(&s.tenant_id, profile_cfg).await;
                             let policy = agent_ti_store::ActivationPolicy {
                                 pinned: pinned.clone(),
                                 max_active: profile_cfg.max_active_tools as usize,
@@ -1130,6 +1172,7 @@ pub async fn start(config: HostConfig) -> Result<(), Box<dyn Error>> {
         accepting: AtomicBool::new(true),
         scheduler: Scheduler::default(),
     });
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     for agent in host.agents.values() {
         let host_info = agent_ti_plugin_sdk::HostInfo {
             storage_dir: &host.config.storage_dir,
@@ -1141,6 +1184,7 @@ pub async fn start(config: HostConfig) -> Result<(), Box<dyn Error>> {
                 .map_err(|e| format!("{}: plugin {} setup: {e}", agent.name, plugin.name()))?;
         }
         agent.start_mcp_listeners(&host.client);
+        agent.start_tenant_skills_watcher(shutdown_rx.clone());
     }
     let scheduler = tokio::spawn(worker::schedule(host.clone()));
     let sweeper = host.clone();
@@ -1156,6 +1200,7 @@ pub async fn start(config: HostConfig) -> Result<(), Box<dyn Error>> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(%addr, agents = ?host.agents.keys().collect::<Vec<_>>(), default = %host.default_agent, "agent-ti listening");
     let shutdown_host = host.clone();
+    let shutdown_signal = shutdown_tx.clone();
     axum::serve(listener, router(host.clone()))
         .with_graceful_shutdown(async move {
             #[cfg(unix)]
@@ -1170,10 +1215,12 @@ pub async fn start(config: HostConfig) -> Result<(), Box<dyn Error>> {
                 let _ = tokio::signal::ctrl_c().await;
             }
             shutdown_host.accepting.store(false, Ordering::SeqCst);
+            let _ = shutdown_signal.send(true);
             shutdown_host.scheduler.wake();
         })
         .await?;
     host.accepting.store(false, Ordering::SeqCst);
+    let _ = shutdown_tx.send(true);
     host.scheduler.wake();
     scheduler.await?;
     for agent in host.agents.values() {

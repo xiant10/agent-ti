@@ -1,5 +1,6 @@
 //! agent-pi's `agent.json`, read unmodified (agent-pi's `config.ts` is the reference).
 use crate::{ConfigError, Raw, Reader, Result, Snapshot, host::cluster_url, substitute};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -13,6 +14,8 @@ pub struct AgentConfig {
     pub instructions: Vec<Section>,
     pub plugins: Vec<PluginRef>,
     pub skills: Vec<SkillConfig>,
+    pub tenant_skills: Option<TenantSkillsConfig>,
+    pub tenant_connectors: Option<TenantConnectorsConfig>,
     pub mcp_servers: Vec<McpServerConfig>,
     pub grants: Option<GrantsConfig>,
     pub limits: AgentLimits,
@@ -22,7 +25,25 @@ pub struct AgentConfig {
     /// Host settings present in the file; the host file's values apply.
     pub host_fields: Vec<String>,
 }
-#[derive(Clone, Debug, PartialEq)]
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TenantSkillsConfig {
+    pub url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TenantConnectorsConfig {
+    pub gateway_url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillSource {
+    pub kind: String,
+    pub version: u64,
+    pub digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SkillConfig {
     pub name: String,
     pub description: String,
@@ -30,6 +51,35 @@ pub struct SkillConfig {
     pub keywords: Vec<String>,
     pub body: String,
     pub files: BTreeMap<String, String>,
+    #[serde(default)]
+    pub flow: Option<Value>,
+    #[serde(default)]
+    pub source: Option<SkillSource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TenantSkillRecord {
+    pub name: String,
+    pub kind: String,
+    pub version: u64,
+    pub digest: String,
+    pub content: TenantSkillContent,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TenantSkillContent {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub keywords: Option<Vec<String>>,
+    #[serde(default)]
+    pub flow: Option<Value>,
+    #[serde(default)]
+    pub files: Option<BTreeMap<String, String>>,
 }
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
@@ -490,6 +540,12 @@ pub fn load_agent(
             let content = snapshot.read_text(&skill_file)?;
             let mut skill = parse_skill(&skill_file, &content)?;
             let prefix = format!("{subdir}/");
+            let flow_file = format!("{dir}/{subdir}/flow.json");
+            if let Ok(flow_content) = snapshot.read_text(&flow_file)
+                && let Ok(flow_val) = serde_json::from_str::<Value>(&flow_content)
+            {
+                skill.flow = Some(flow_val);
+            }
             for item in &list {
                 if let Some(sub_path) = item.strip_prefix(&prefix)
                     && sub_path != "SKILL.md"
@@ -516,37 +572,48 @@ pub fn load_agent(
         }
     }
     let tenant_skills = r.optional_object(top.get("tenantSkills"), "tenantSkills", &["url"])?;
-    if let Some(url) = r.optional_string(tenant_skills.get("url"), "tenantSkills.url")? {
-        if !grants_on {
-            return r.fail(
-                "tenantSkills",
-                "needs a grants section, for the runtime's service account",
-            );
+    let tenant_skills_url = r.optional_string(tenant_skills.get("url"), "tenantSkills.url")?;
+    let tenant_skills_cfg = if let Some(url) = tenant_skills_url {
+        if !url.is_empty() {
+            if !grants_on {
+                return r.fail(
+                    "tenantSkills",
+                    "needs a grants section, for the runtime's service account",
+                );
+            }
+            cluster_url(&url, &source, "tenantSkills.url")?;
+            Some(TenantSkillsConfig { url })
+        } else {
+            None
         }
-        cluster_url(&url, &source, "tenantSkills.url")?;
-        note("tenantSkills", "step 7");
-    }
+    } else {
+        None
+    };
     let tenant_connectors = r.optional_object(
         top.get("tenantConnectors"),
         "tenantConnectors",
         &["gatewayUrl"],
     )?;
-    if r.optional_string(
+    let gateway_url = r.optional_string(
         tenant_connectors.get("gatewayUrl"),
         "tenantConnectors.gatewayUrl",
-    )?
-    .is_some()
-    {
-        if r.optional_string(tenant_skills.get("url"), "tenantSkills.url")?
-            .is_none()
-        {
-            return r.fail(
-                "tenantConnectors",
-                "needs tenantSkills.url, where connectors are published",
-            );
+    )?;
+    let tenant_connectors_cfg = if let Some(gw) = gateway_url {
+        if !gw.is_empty() {
+            if tenant_skills_cfg.is_none() {
+                return r.fail(
+                    "tenantConnectors",
+                    "needs tenantSkills.url, where connectors are published",
+                );
+            }
+            cluster_url(&gw, &source, "tenantConnectors.gatewayUrl")?;
+            Some(TenantConnectorsConfig { gateway_url: gw })
+        } else {
+            None
         }
-        note("tenantConnectors", "step 7");
-    }
+    } else {
+        None
+    };
 
     let mut mcp_servers = Vec::new();
     for (index, value) in top
@@ -746,6 +813,8 @@ pub fn load_agent(
         instructions,
         plugins,
         skills,
+        tenant_skills: tenant_skills_cfg,
+        tenant_connectors: tenant_connectors_cfg,
         mcp_servers,
         grants: grants_config,
         limits,
@@ -1014,7 +1083,245 @@ pub fn parse_skill(file: &str, content: &str) -> Result<SkillConfig> {
         keywords,
         body,
         files: BTreeMap::new(),
+        flow: None,
+        source: None,
     })
+}
+
+pub fn pattern_matches_glob(pattern: &str, text: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == text;
+    }
+    let mut remainder = text;
+    if !parts[0].is_empty() {
+        if !remainder.starts_with(parts[0]) {
+            return false;
+        }
+        remainder = &remainder[parts[0].len()..];
+    }
+    for (i, part) in parts.iter().enumerate().skip(1) {
+        if i == parts.len() - 1 && !part.is_empty() {
+            return remainder.ends_with(part) && remainder.len() >= part.len();
+        }
+        if !part.is_empty() {
+            if let Some(pos) = remainder.find(part) {
+                remainder = &remainder[pos + part.len()..];
+            } else {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+pub fn tool_allowed_by_skill(tool: &str, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    patterns.iter().any(|pattern| {
+        let bare = if let Some(idx) = pattern.find(':') {
+            &pattern[idx + 1..]
+        } else {
+            pattern.as_str()
+        };
+        let underscored = pattern.replace(':', "_");
+        if bare == "*" || bare == tool || pattern == tool || underscored == tool {
+            return true;
+        }
+        for candidate in [bare, &underscored] {
+            if candidate.contains('*') && pattern_matches_glob(candidate, tool) {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+pub fn is_valid_reference_file_path(path: &str) -> bool {
+    if path.is_empty() || path.starts_with('/') || path.starts_with('.') || path.contains("..") {
+        return false;
+    }
+    for segment in path.split('/') {
+        if segment.is_empty() || segment.starts_with('.') {
+            return false;
+        }
+        for (i, c) in segment.chars().enumerate() {
+            if i == 0 {
+                if !c.is_ascii_alphanumeric() && c != '_' && c != '-' {
+                    return false;
+                }
+            } else if !c.is_ascii_alphanumeric() && c != '.' && c != '_' && c != '-' {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn extract_flow_tools(flow: &Value) -> Vec<String> {
+    let mut tools = Vec::new();
+    if let Some(nodes) = flow.get("nodes").and_then(Value::as_array) {
+        for node in nodes {
+            if let Some(call) = node.get("call").and_then(Value::as_object)
+                && let Some(tool) = call.get("tool").and_then(Value::as_str)
+            {
+                tools.push(tool.to_string());
+            }
+        }
+    }
+    tools
+}
+
+fn validate_flow_patterns(flow: &Value) -> std::result::Result<(), String> {
+    if let Some(nodes) = flow.get("nodes").and_then(Value::as_array) {
+        for node in nodes {
+            let node_id = node.get("id").and_then(Value::as_str).unwrap_or("step");
+            if let Some(extract) = node.get("extract").and_then(Value::as_object) {
+                for (field, spec) in extract {
+                    if let Some(pat) = spec.get("pattern").and_then(Value::as_str)
+                        && pat.chars().count() > 200
+                    {
+                        return Err(format!(
+                            "step {node_id}: the pattern for {field} is longer than 200 characters"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn apply_tenant_skills(
+    base: &[SkillConfig],
+    records: &[TenantSkillRecord],
+    mut skipped: impl FnMut(&TenantSkillRecord, &str),
+) -> Vec<SkillConfig> {
+    let mut by_name: BTreeMap<String, SkillConfig> =
+        base.iter().map(|s| (s.name.clone(), s.clone())).collect();
+
+    for record in records {
+        let source = SkillSource {
+            kind: record.kind.clone(),
+            version: record.version,
+            digest: record.digest.clone(),
+        };
+        if record.kind == "override" {
+            let Some(builtin) = by_name.get(&record.name) else {
+                skipped(record, "there's no built-in skill of that name");
+                continue;
+            };
+            let Some(ref flow) = record.content.flow else {
+                skipped(record, "an override needs a workflow");
+                continue;
+            };
+            let tools = extract_flow_tools(flow);
+            let mut tool_err = None;
+            for tool in &tools {
+                if !tool_allowed_by_skill(tool, &builtin.tools) {
+                    tool_err = Some(format!(
+                        "tool \"{tool}\" isn't one of the skill's tools ({})",
+                        if builtin.tools.is_empty() {
+                            "none".to_string()
+                        } else {
+                            builtin.tools.join(", ")
+                        }
+                    ));
+                    break;
+                }
+            }
+            if let Some(err) = tool_err {
+                skipped(record, &format!("skill {}: {err}", record.name));
+                continue;
+            }
+            if let Err(e) = validate_flow_patterns(flow) {
+                skipped(record, &e);
+                continue;
+            }
+            let mut overridden = builtin.clone();
+            overridden.flow = Some(flow.clone());
+            overridden.source = Some(source);
+            by_name.insert(record.name.clone(), overridden);
+        } else if record.kind == "custom" {
+            if base.iter().any(|b| b.name == record.name) {
+                skipped(record, "a built-in skill has that name");
+                continue;
+            }
+            let description = record.content.description.as_deref().unwrap_or("").trim();
+            if description.is_empty() {
+                skipped(
+                    record,
+                    &format!("skill {}: needs a description", record.name),
+                );
+                continue;
+            }
+            let tools = record.content.tools.clone().unwrap_or_default();
+            if let Some(ref flow) = record.content.flow {
+                let flow_tools = extract_flow_tools(flow);
+                let mut tool_err = None;
+                for tool in &flow_tools {
+                    if !tool_allowed_by_skill(tool, &tools) {
+                        tool_err = Some(format!(
+                            "tool \"{tool}\" isn't in the skill's tools ({})",
+                            if tools.is_empty() {
+                                "none".to_string()
+                            } else {
+                                tools.join(", ")
+                            }
+                        ));
+                        break;
+                    }
+                }
+                if let Some(err) = tool_err {
+                    skipped(record, &format!("skill {}: {err}", record.name));
+                    continue;
+                }
+                if let Err(e) = validate_flow_patterns(flow) {
+                    skipped(record, &e);
+                    continue;
+                }
+            }
+            let mut files = BTreeMap::new();
+            let mut bad_file = false;
+            if let Some(ref rec_files) = record.content.files {
+                for (p, text) in rec_files {
+                    if !is_valid_reference_file_path(p) {
+                        skipped(
+                            record,
+                            &format!("skill {}: {p:?} isn't a reference file path", record.name),
+                        );
+                        bad_file = true;
+                        break;
+                    }
+                    files.insert(p.clone(), text.clone());
+                }
+            }
+            if bad_file {
+                continue;
+            }
+            let custom = SkillConfig {
+                name: record.name.clone(),
+                description: description.to_string(),
+                tools,
+                keywords: record.content.keywords.clone().unwrap_or_default(),
+                body: record.content.body.clone().unwrap_or_default(),
+                files,
+                flow: record.content.flow.clone(),
+                source: Some(source),
+            };
+            by_name.insert(record.name.clone(), custom);
+        } else {
+            skipped(record, &format!("unknown skill kind: {}", record.kind));
+        }
+    }
+
+    let mut result: Vec<_> = by_name.into_values().collect();
+    result.sort_by(|a, b| a.name.cmp(&b.name));
+    result
 }
 
 pub fn read_skill_file<'a>(
@@ -1022,7 +1329,11 @@ pub fn read_skill_file<'a>(
     path: &str,
 ) -> std::result::Result<&'a str, String> {
     let clean = path.strip_prefix("./").unwrap_or(path);
-    if clean.starts_with("..") || clean.contains("/..") || clean.is_empty() {
+    if clean.starts_with("..")
+        || clean.contains("/..")
+        || clean.starts_with('/')
+        || clean.is_empty()
+    {
         return Err(format!("{path:?} is outside skill {}", skill.name));
     }
     skill.files.get(clean).map(|s| s.as_str()).ok_or_else(|| {
@@ -1092,5 +1403,188 @@ mod tests {
                 .unwrap_err()
                 .contains("outside")
         );
+    }
+
+    #[test]
+    fn test_apply_tenant_skills() {
+        let weather = SkillConfig {
+            name: "weather".into(),
+            description: "Weather forecasts".into(),
+            tools: vec!["crm:get_forecast".into()],
+            keywords: vec![],
+            body: "Built-in weather instructions.".into(),
+            files: BTreeMap::new(),
+            flow: Some(serde_json::json!({
+                "nodes": [
+                    { "id": "start", "kind": "start" },
+                    { "id": "reply", "kind": "llm_reply" }
+                ]
+            })),
+            source: None,
+        };
+
+        let override_rec = TenantSkillRecord {
+            name: "weather".into(),
+            kind: "override".into(),
+            version: 1,
+            digest: "sha256:1".into(),
+            content: TenantSkillContent {
+                description: None,
+                body: None,
+                tools: None,
+                keywords: None,
+                flow: Some(serde_json::json!({
+                    "title": "Acme weather",
+                    "nodes": [
+                        { "id": "start", "kind": "start" },
+                        { "id": "call", "kind": "tool", "call": { "tool": "crm_get_forecast" } },
+                        { "id": "reply", "kind": "llm_reply" }
+                    ]
+                })),
+                files: None,
+            },
+        };
+
+        let mut files = BTreeMap::new();
+        files.insert("refs/tiers.md".into(), "Tier A: over 1M ARR.".into());
+        let vip = TenantSkillRecord {
+            name: "vip-intake".into(),
+            kind: "custom".into(),
+            version: 1,
+            digest: "sha256:v".into(),
+            content: TenantSkillContent {
+                description: Some("VIP intake".into()),
+                body: Some("Ask for the VIP account number first.".into()),
+                tools: Some(vec!["crm:get_forecast".into()]),
+                keywords: Some(vec!["vip".into()]),
+                flow: None,
+                files: Some(files),
+            },
+        };
+
+        let mut skipped = Vec::new();
+        let view = apply_tenant_skills(
+            std::slice::from_ref(&weather),
+            &[override_rec, vip],
+            |rec, reason| skipped.push(format!("{}: {reason}", rec.name)),
+        );
+        assert!(skipped.is_empty(), "unexpected skips: {skipped:?}");
+        assert_eq!(view.len(), 2);
+        assert_eq!(view[0].name, "vip-intake");
+        assert_eq!(view[1].name, "weather");
+
+        let weather_view = &view[1];
+        assert_eq!(weather_view.body, weather.body);
+        assert_eq!(weather_view.flow.as_ref().unwrap()["title"], "Acme weather");
+        assert_eq!(weather_view.source.as_ref().unwrap().digest, "sha256:1");
+
+        let vip_view = &view[0];
+        assert_eq!(
+            read_skill_file(vip_view, "refs/tiers.md").unwrap(),
+            "Tier A: over 1M ARR."
+        );
+        assert_eq!(
+            read_skill_file(vip_view, "./refs/tiers.md").unwrap(),
+            "Tier A: over 1M ARR."
+        );
+        assert!(read_skill_file(vip_view, "../weather/SKILL.md").is_err());
+        assert!(read_skill_file(vip_view, "/etc/passwd").is_err());
+        assert!(read_skill_file(vip_view, "refs/other.md").is_err());
+    }
+
+    #[test]
+    fn test_apply_tenant_skills_validation_skips() {
+        let weather = SkillConfig {
+            name: "weather".into(),
+            description: "Weather forecasts".into(),
+            tools: vec!["crm:get_forecast".into()],
+            keywords: vec![],
+            body: "Built-in weather instructions.".into(),
+            files: BTreeMap::new(),
+            flow: None,
+            source: None,
+        };
+
+        let bad_tool_override = TenantSkillRecord {
+            name: "weather".into(),
+            kind: "override".into(),
+            version: 1,
+            digest: "sha256:1".into(),
+            content: TenantSkillContent {
+                flow: Some(serde_json::json!({
+                    "nodes": [
+                        { "id": "call", "kind": "tool", "call": { "tool": "delete_everything" } }
+                    ]
+                })),
+                ..Default::default()
+            },
+        };
+
+        let missing_override = TenantSkillRecord {
+            name: "missing".into(),
+            kind: "override".into(),
+            version: 1,
+            digest: "sha256:1".into(),
+            content: TenantSkillContent {
+                flow: Some(serde_json::json!({ "nodes": [] })),
+                ..Default::default()
+            },
+        };
+
+        let colliding_custom = TenantSkillRecord {
+            name: "weather".into(),
+            kind: "custom".into(),
+            version: 1,
+            digest: "sha256:1".into(),
+            content: TenantSkillContent {
+                description: Some("colliding".into()),
+                ..Default::default()
+            },
+        };
+
+        let bad_regex = TenantSkillRecord {
+            name: "bad-regex".into(),
+            kind: "custom".into(),
+            version: 1,
+            digest: "sha256:1".into(),
+            content: TenantSkillContent {
+                description: Some("bad regex".into()),
+                flow: Some(serde_json::json!({
+                    "nodes": [
+                        { "id": "step1", "extract": { "q": { "pattern": "a".repeat(201) } } }
+                    ]
+                })),
+                ..Default::default()
+            },
+        };
+
+        let mut bad_files = BTreeMap::new();
+        bad_files.insert("../x.md".into(), "bad".into());
+        let bad_path = TenantSkillRecord {
+            name: "bad-path".into(),
+            kind: "custom".into(),
+            version: 1,
+            digest: "sha256:1".into(),
+            content: TenantSkillContent {
+                description: Some("bad path".into()),
+                files: Some(bad_files),
+                ..Default::default()
+            },
+        };
+
+        let mut skipped = Vec::new();
+        let view = apply_tenant_skills(
+            std::slice::from_ref(&weather),
+            &[
+                bad_tool_override,
+                missing_override,
+                colliding_custom,
+                bad_regex,
+                bad_path,
+            ],
+            |rec, reason| skipped.push(format!("{}: {reason}", rec.name)),
+        );
+        assert_eq!(view, vec![weather]);
+        assert_eq!(skipped.len(), 5);
     }
 }

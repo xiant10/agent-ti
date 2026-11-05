@@ -289,13 +289,22 @@ impl Journal {
             }
         };
         let file = call.arguments.get("file").and_then(Value::as_str);
-        let skill = match self.agent.config.skills.iter().find(|s| s.name == name) {
+
+        let skills = match self.agent.turn_pins.get(&self.work.session_id).await {
             Some(s) => s,
             None => {
-                let available = self
-                    .agent
-                    .config
-                    .skills
+                if let Some(ref ts) = self.agent.tenant_skills {
+                    ts.for_tenant(Some(&self.work.scope.tenant_id)).await
+                } else {
+                    Arc::new(self.agent.config.skills.clone())
+                }
+            }
+        };
+
+        let skill = match skills.iter().find(|s| s.name == name) {
+            Some(s) => s,
+            None => {
+                let available = skills
                     .iter()
                     .map(|s| s.name.as_str())
                     .collect::<Vec<_>>()
@@ -317,9 +326,9 @@ impl Journal {
         }
 
         let tenant = &self.work.scope.tenant_id;
-        let matched_names = self.agent.match_tools(&skill.tools, tenant);
+        let matched_names = self.agent.match_tools(&skill.tools, tenant).await;
         let profile = &self.agent.config.profiles[&self.work.profile];
-        let pinned = self.agent.pinned_tools(tenant, profile);
+        let pinned = self.agent.pinned_tools(tenant, profile).await;
         let policy = agent_ti_store::ActivationPolicy {
             pinned,
             max_active: profile.max_active_tools as usize,
@@ -346,9 +355,10 @@ impl Journal {
             .get_session_tools(&self.work.scope, &self.work.session_id)
             .await
             .unwrap_or_default();
-        *self.tools.write().unwrap() =
-            self.agent
-                .offered(&self.work.scope.tenant_id, profile, &active.offered);
+        *self.tools.write().unwrap() = self
+            .agent
+            .offered(&self.work.scope.tenant_id, profile, &active.offered)
+            .await;
 
         let footer = if matched_names.is_empty() && !skill.tools.is_empty() {
             "\n\n(The tools this skill uses are unavailable right now; they are enabled automatically once their server connects.)".to_string()
@@ -392,7 +402,8 @@ impl Journal {
 
         let hits = self
             .agent
-            .search_tools(query, limit, &self.work.scope.tenant_id);
+            .search_tools(query, limit, &self.work.scope.tenant_id)
+            .await;
         if hits.is_empty() {
             return ToolOutcome::ok("No tools matched. Try other words.");
         }
@@ -409,7 +420,7 @@ impl Journal {
 
         let tenant = &self.work.scope.tenant_id;
         let profile = &self.agent.config.profiles[&self.work.profile];
-        let pinned = self.agent.pinned_tools(tenant, profile);
+        let pinned = self.agent.pinned_tools(tenant, profile).await;
         let policy = agent_ti_store::ActivationPolicy {
             pinned,
             max_active: profile.max_active_tools as usize,
@@ -430,9 +441,10 @@ impl Journal {
             .get_session_tools(&self.work.scope, &self.work.session_id)
             .await
             .unwrap_or_default();
-        *self.tools.write().unwrap() =
-            self.agent
-                .offered(&self.work.scope.tenant_id, profile, &active.offered);
+        *self.tools.write().unwrap() = self
+            .agent
+            .offered(&self.work.scope.tenant_id, profile, &active.offered)
+            .await;
 
         ToolOutcome::ok(reply_text)
     }
@@ -568,6 +580,69 @@ impl ToolPort for Journal {
                         self.execute_search_tools(&call).await
                     } else if let Some(ref handler) = tool.handler {
                         (handler)(call.arguments.clone()).await
+                    } else if let Some(ref conn) = tool.connector {
+                        if conn.tenant_id != self.work.scope.tenant_id {
+                            return Ok(ToolOutcome::error(format!(
+                                "Tool {} belongs to another tenant.",
+                                tool.name
+                            )));
+                        }
+                        let Some(ref tc) = self.agent.tenant_connectors else {
+                            return Ok(ToolOutcome::error("Tenant connectors are not configured."));
+                        };
+                        let grant_token = match self.agent.grants {
+                            Some(ref broker) => {
+                                match broker.token(&self.agent.store, &self.work.session_id).await {
+                                    Ok(tok) => tok,
+                                    Err(crate::grants::GrantError::Stopped) => {
+                                        return Ok(ToolOutcome::error(
+                                            "The agent's access was stopped; end this task and tell the user.",
+                                        ));
+                                    }
+                                    Err(crate::grants::GrantError::Expired) => {
+                                        return Ok(ToolOutcome::error(
+                                            "The agent's access has expired; ask the user to send a message to renew it.",
+                                        ));
+                                    }
+                                    Err(crate::grants::GrantError::Unavailable(e)) => {
+                                        return Ok(ToolOutcome::error(format!(
+                                            "the auth service is unavailable: {e}"
+                                        )));
+                                    }
+                                }
+                            }
+                            None => {
+                                return Ok(ToolOutcome::error(format!(
+                                    "{} needs an agent grant, and this agent has none configured.",
+                                    tool.name
+                                )));
+                            }
+                        };
+                        let srv = agent_ti_config::McpServerConfig {
+                            name: conn.connector_name.clone(),
+                            url: format!(
+                                "{}/mcp/connector/{}",
+                                tc.gateway_url().trim_end_matches('/'),
+                                conn.connector_id
+                            ),
+                            auth: agent_ti_config::McpAuth::Grant { token_header: None },
+                            headers: std::collections::BTreeMap::new(),
+                            include: vec![],
+                            exclude: vec![],
+                            prefix: String::new(),
+                            max_description_chars: 1000,
+                            call_timeout_ms: 30_000,
+                            agent_context: false,
+                        };
+                        adapters::mcp_call(
+                            &self.host.client,
+                            &srv,
+                            &tool.mcp_name,
+                            call.arguments.clone(),
+                            Some(&grant_token),
+                            None,
+                        )
+                        .await
                     } else {
                         let server = &self.agent.config.mcp_servers[tool.server];
                         let grant_token = if let agent_ti_config::McpAuth::Grant { .. } =
@@ -710,8 +785,19 @@ async fn run(
         .get(&work.profile)
         .ok_or(ExecutionError::Denied)?;
     let model = &agent.config.models[&profile.model];
+    let session_skills = match agent.turn_pins.get(&work.session_id).await {
+        Some(s) => s,
+        None => {
+            if let Some(ref ts) = agent.tenant_skills {
+                ts.for_tenant(Some(&work.scope.tenant_id)).await
+            } else {
+                Arc::new(agent.config.skills.clone())
+            }
+        }
+    };
+    let instructions = agent.render_instructions(&work.profile, &session_skills);
     let spec = ExecutionSpec {
-        instructions: agent.instructions[&work.profile].clone(),
+        instructions,
         model: profile.model.clone(),
         max_output_tokens: model.max_output_tokens.unwrap_or(4096).min(u32::MAX as u64) as u32,
         max_tool_rounds: agent.config.limits.max_tool_rounds,
@@ -725,11 +811,13 @@ async fn run(
         .await
         .unwrap_or_default();
     let offered_names = if session_tools.offered.is_empty() {
-        agent.pinned_tools(&work.scope.tenant_id, profile)
+        agent.pinned_tools(&work.scope.tenant_id, profile).await
     } else {
         session_tools.offered
     };
-    let offered_list = agent.offered(&work.scope.tenant_id, profile, &offered_names);
+    let offered_list = agent
+        .offered(&work.scope.tenant_id, profile, &offered_names)
+        .await;
     let descriptors = offered_list
         .iter()
         .map(|t| ToolDescriptor {

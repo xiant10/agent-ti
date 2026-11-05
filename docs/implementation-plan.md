@@ -60,14 +60,16 @@ The review's fix-now list, done with step 1 on 2026-11-05:
 | 4 ✓ | `session.steer`, `session.interrupt` (with `duringTools`), `session.retry`, `whenBusy`, the session inbox | `service.ts` | Barge-in and steer behave as agent-pi's `flow.test.ts` and `agent.test.ts` describe |
 | 5 ✓ | Tool catalog, active set, `load_skill`, `search_tools` (BM25), preload, eviction, `tools.active` events; agent-pi skill files | `tools/catalog.ts`, `activation.ts`, `skills/skills.ts` | The assistant's `skills/` work unchanged |
 | 6 ✓ | Grants from auth-server for `auth: "grant"` MCP servers; Streamable HTTP MCP with `list_changed`; collab and knowledge connected | `auth/grants.ts`, `mcp/manager.ts` | A collab tool runs as the user, and continues after a restart with the user offline |
-| 7 | Tenant skills from `t10-agent-control` (ETag cache, change feed); tenant connectors as a `perTenant` grant MCP server at the gateway's `/mcp/tenant` ([design](../../t10-agent-control/docs/tenant-connectors.md#control-gateway-and-harness)) | `skills/tenant.ts`, agent-pi's `perTenant` server | A skill published in Workbench reaches the next turn; two tenants' connectors never mix |
+| 7 ✓ | Tenant skills from `t10-agent-control` (ETag cache, change feed); tenant connectors as a `perTenant` grant MCP server at the gateway's `/mcp/tenant` ([design](../../t10-agent-control/docs/tenant-connectors.md#control-gateway-and-harness)) | `skills/tenant.ts`, agent-pi's `perTenant` server | A skill published in Workbench reaches the next turn; two tenants' connectors never mix |
 | 8 | Profiles in full, `speech` events, `consult_expert`; voice through `t10-livekit-agent` | `events/speech.ts`, `agent/profiles.ts`, `agent/subagents.ts` | A voice call works on a `voice` profile |
 | 9 | Compaction in place of the eight-turn window | pi-durable compaction settings | A long session keeps a stable request size |
 | 10 | Sub-agents, background tasks, flows | `docs/delegation.md`, `docs/async-tasks.md`, `flow/engine.ts` | agent-pi's tests for each have Rust equivalents that pass |
 | 11 | Replicas: `<agent>.<replica>.<n>` IDs, 421 with `Agent-Instance`, N StatefulSet replicas | `docs/replicas.md` | The gateway routes to three replicas |
 | 12 | Operations: metrics, retention job, online backup, read pool, load test with `t10-perf` | — | Measured limits replace the current defaults |
 
-Steps 1–6 are done (2026-11-05). Step 7 comes next: tenant skills from `t10-agent-control` (ETag cache, change feed) and tenant connectors as a `perTenant` grant MCP server. Steps 6–7 make it equivalent to agent-pi for text agents. Step 8 adds voice.
+## Status
+
+Steps 1–7 are done (2026-11-05). Step 8 comes next: profiles in full, speech events, consult_expert, and voice through `t10-livekit-agent`. Steps 6–7 make it equivalent to agent-pi for text agents. Step 8 adds voice.
 
 ## Testing
 

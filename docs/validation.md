@@ -171,6 +171,35 @@ The runtime now implements dynamic tool discovery, activation, BM25 indexing, an
 | Parent `node contracts/agent/conformance.ts agent-ti` | **19 of 20 passed** (all 16 required + 3 optional capabilities: `steer`, `interrupt`, and `retry`; only `voice` skipped) |
 | `node agent-ti/scripts/test-local.mjs` | Full HTTP smoke, live streaming, recovery during model call SIGKILL, and recovery during unsafe tool call SIGKILL passed |
 
+## 2026-11-05: step 7, tenant skills from t10-agent-control and tenant connectors
+
+The runtime now implements tenant skills, author drafts, reference files, turn pinning, and tenant connectors:
+- **Tenant Skills & Control integration** (`crates/agent-ti-config` & `src/tenant_skills.rs`):
+  - Fetches tenant skills and workflow overrides from `t10-agent-control` (`GET /v1/runtime/skills?tenant={tenant}`) with ETag caching (10s fresh, 5m stale fallback, 304 Not Modified).
+  - Background change feed watcher follows `/v1/runtime/skills/changes?after={cursor}` and invalidates the tenant cache on publication.
+  - Author drafts support: test sessions with `session.metadata.skillDraft` resolve draft skill definitions via `/v1/runtime/skills/draft`.
+  - Turn pinning (`TurnPins`): skills available at turn start remain pinned in memory for the turn duration, preventing mid-turn skill changes from affecting running turns.
+  - Custom tenant skill reference files: `skill.files` validated and served by `load_skill` via `file` parameter.
+  - Built-in skills support `flow.json` alongside `SKILL.md`.
+- **Tenant Connectors** (`src/tenant_connectors.rs` & `src/agents.rs`):
+  - Fetches published connector tools from `t10-agent-control` (`GET /v1/runtime/connectors?tenant={tenant}`) with ETag caching and change feed invalidation.
+  - Connector tool scoping: exposed as `{connector_name}_{tool_name}` to avoid collisions with platform tools.
+  - Complete tenant isolation: two tenants' connectors never mix or leak.
+  - Gateway dispatch under grant auth: connector tools are dispatched to `{gatewayUrl}/mcp/connector/{connectorId}` using a short-lived token minted by `GrantBroker`.
+- **Worker & Server RPC integration** (`src/worker.rs` & `src/server.rs`):
+  - Dynamic tool matching, preloading, and active set management incorporates tenant connector tools.
+  - System prompt `<skills>` dynamically renders pinned tenant skills and built-in skills.
+  - `skills.list`, `skills.get`, and `skills.tools` RPC endpoints return tenant-aware skills and tools.
+
+| Check | Observed result |
+| --- | --- |
+| `cargo test --workspace --locked` | **46 tests passed** (including unit tests in `agent-ti-config` and integration tests in `tests/tenant_skills.rs` and `tests/tenant_connectors.rs`) |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | Passed with 0 warnings |
+| `cargo doc --workspace --no-deps --locked` | Passed |
+| Parent `node contracts/agent/conformance.ts agent-ti` | **19 of 20 passed** (all 16 required + 3 optional capabilities: `steer`, `interrupt`, and `retry`; only `voice` skipped) |
+| `node agent-ti/scripts/test-local.mjs` | Full HTTP smoke, live streaming, recovery during model call SIGKILL, and recovery during unsafe tool call SIGKILL passed |
+
 ## 2026-11-05: step 6, grants from auth-server for auth: "grant" MCP servers; Streamable HTTP MCP with list_changed
 
 The runtime now implements auth grants, offline recovery, MCP grant authentication, and streamable HTTP MCP dynamic re-listing:
@@ -197,6 +226,35 @@ The runtime now implements auth grants, offline recovery, MCP grant authenticati
 | Check | Observed result |
 | --- | --- |
 | `cargo test --workspace --locked` | **41 tests passed** (including unit and integration tests across all crates, `tests/grants.rs`, and `tests/mcp.rs`) |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | Passed with 0 warnings |
+| `cargo doc --workspace --no-deps --locked` | Passed |
+| Parent `node contracts/agent/conformance.ts agent-ti` | **19 of 20 passed** (all 16 required + 3 optional capabilities: `steer`, `interrupt`, and `retry`; only `voice` skipped) |
+| `node agent-ti/scripts/test-local.mjs` | Full HTTP smoke, live streaming, recovery during model call SIGKILL, and recovery during unsafe tool call SIGKILL passed |
+
+## 2026-11-05: step 7, tenant skills from t10-agent-control and tenant connectors
+
+The runtime now implements tenant skills, author drafts, reference files, turn pinning, and tenant connectors:
+- **Tenant Skills & Control integration** (`crates/agent-ti-config` & `src/tenant_skills.rs`):
+  - Fetches tenant skills and workflow overrides from `t10-agent-control` (`GET /v1/runtime/skills?tenant={tenant}`) with ETag caching (10s fresh, 5m stale fallback, 304 Not Modified).
+  - Background change feed watcher follows `/v1/runtime/skills/changes?after={cursor}` and invalidates the tenant cache on publication.
+  - Author drafts support: test sessions with `session.metadata.skillDraft` resolve draft skill definitions via `/v1/runtime/skills/draft`.
+  - Turn pinning (`TurnPins`): skills available at turn start remain pinned in memory for the turn duration, preventing mid-turn skill changes from affecting running turns.
+  - Custom tenant skill reference files: `skill.files` validated and served by `load_skill` via `file` parameter.
+  - Built-in skills support `flow.json` alongside `SKILL.md`.
+- **Tenant Connectors** (`src/tenant_connectors.rs` & `src/agents.rs`):
+  - Fetches published connector tools from `t10-agent-control` (`GET /v1/runtime/connectors?tenant={tenant}`) with ETag caching and change feed invalidation.
+  - Connector tool scoping: exposed as `{connector_name}_{tool_name}` to avoid collisions with platform tools.
+  - Complete tenant isolation: two tenants' connectors never mix or leak.
+  - Gateway dispatch under grant auth: connector tools are dispatched to `{gatewayUrl}/mcp/connector/{connectorId}` using a short-lived token minted by `GrantBroker`.
+- **Worker & Server RPC integration** (`src/worker.rs` & `src/server.rs`):
+  - Dynamic tool matching, preloading, and active set management incorporates tenant connector tools.
+  - System prompt `<skills>` dynamically renders pinned tenant skills and built-in skills.
+  - `skills.list`, `skills.get`, and `skills.tools` RPC endpoints return tenant-aware skills and tools.
+
+| Check | Observed result |
+| --- | --- |
+| `cargo test --workspace --locked` | **46 tests passed** (including unit tests in `agent-ti-config` and integration tests in `tests/tenant_skills.rs` and `tests/tenant_connectors.rs`) |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | Passed with 0 warnings |
 | `cargo doc --workspace --no-deps --locked` | Passed |

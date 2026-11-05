@@ -13,6 +13,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Information about a tool provided by a tenant connector.
+#[derive(Clone)]
+pub struct TenantConnectorTarget {
+    pub tenant_id: String,
+    pub connector_id: String,
+    pub connector_name: String,
+}
+
 /// A tool offered to the model: an MCP server's tool under the server's prefix.
 pub struct ToolEntry {
     pub name: String,
@@ -22,6 +30,7 @@ pub struct ToolEntry {
     pub schema: Value,
     pub validator: jsonschema::Validator,
     pub handler: Option<agent_ti_plugin_sdk::ToolHandler>,
+    pub connector: Option<TenantConnectorTarget>,
 }
 /// A server's listed tools, `None` until a listing succeeds, and when it was last tried.
 type Listing = (Option<Arc<Vec<ToolEntry>>>, Option<Instant>);
@@ -46,6 +55,9 @@ pub struct Agent {
     /// False after a storage failure: this agent stops admitting work, the others carry on.
     pub accepting: AtomicBool,
     pub grants: Option<Arc<crate::grants::GrantBroker>>,
+    pub tenant_skills: Option<Arc<crate::tenant_skills::TenantSkills>>,
+    pub tenant_connectors: Option<Arc<crate::tenant_connectors::TenantConnectors>>,
+    pub turn_pins: Arc<crate::tenant_skills::TurnPins>,
     catalog: RwLock<Catalog>,
 }
 fn pattern(glob: &str, text: &str) -> bool {
@@ -83,6 +95,7 @@ fn meta_tools() -> Vec<ToolEntry> {
             schema: load_skill_schema,
             validator: load_skill_validator,
             handler: None,
+            connector: None,
         },
         ToolEntry {
             name: "search_tools".into(),
@@ -92,6 +105,7 @@ fn meta_tools() -> Vec<ToolEntry> {
             schema: search_tools_schema,
             validator: search_tools_validator,
             handler: None,
+            connector: None,
         },
     ]
 }
@@ -199,6 +213,7 @@ impl Agent {
                     schema: tool.parameters,
                     validator,
                     handler: Some(tool.handler),
+                    connector: None,
                 });
             }
         }
@@ -241,6 +256,40 @@ impl Agent {
                 reqwest::Client::new(),
             ))
         });
+        let tenant_skills = if let (Some(ts_cfg), Some(broker)) = (&config.tenant_skills, &grants) {
+            Some(Arc::new(crate::tenant_skills::TenantSkills::new(
+                Arc::new(config.skills.clone()),
+                ts_cfg.url.clone(),
+                broker.clone(),
+                reqwest::Client::new(),
+            )))
+        } else {
+            None
+        };
+        let tenant_connectors = if let (Some(tc_cfg), Some(ts_cfg), Some(broker)) =
+            (&config.tenant_connectors, &config.tenant_skills, &grants)
+        {
+            Some(Arc::new(crate::tenant_connectors::TenantConnectors::new(
+                ts_cfg.url.clone(),
+                tc_cfg.gateway_url.clone(),
+                broker.clone(),
+                reqwest::Client::new(),
+            )))
+        } else {
+            None
+        };
+        if let (Some(ts), Some(tc)) = (&tenant_skills, &tenant_connectors) {
+            let tc_clone = tc.clone();
+            ts.add_listener(Box::new(move |tenant: &str| {
+                let tc = tc_clone.clone();
+                let tenant = tenant.to_string();
+                tokio::spawn(async move {
+                    tc.changed(&tenant).await;
+                });
+            }))
+            .await;
+        }
+        let turn_pins = Arc::new(crate::tenant_skills::TurnPins::default());
         Ok(Self {
             name,
             version,
@@ -256,6 +305,9 @@ impl Agent {
                 plugin_tools: Arc::new(plugin_tools),
             }),
             grants,
+            tenant_skills,
+            tenant_connectors,
+            turn_pins,
             config,
         })
     }
@@ -301,6 +353,7 @@ impl Agent {
                 schema: tool.input_schema,
                 validator,
                 handler: None,
+                connector: None,
             });
         }
         entries
@@ -488,18 +541,26 @@ impl Agent {
             }
         }
     }
-    pub fn pinned_tools(&self, tenant: &str, profile: &ProfileConfig) -> Vec<String> {
-        let mut pinned = vec!["load_skill".to_string(), "search_tools".to_string()];
-        let matched = self.match_tools(&profile.always_on_tools, tenant);
-        for name in matched {
-            if !pinned.contains(&name) {
-                pinned.push(name);
+    pub fn platform_tool_names(&self) -> Vec<String> {
+        let catalog = self.catalog.read().unwrap();
+        let mut names = Vec::new();
+        for t in catalog.meta_tools.iter() {
+            names.push(t.name.clone());
+        }
+        for t in catalog.plugin_tools.iter() {
+            names.push(t.name.clone());
+        }
+        for (tools, _) in &catalog.servers {
+            if let Some(list) = tools {
+                for t in list.iter() {
+                    names.push(t.name.clone());
+                }
             }
         }
-        pinned
+        names
     }
 
-    pub fn match_tools(&self, patterns: &[String], tenant: &str) -> Vec<String> {
+    pub fn match_tools_sync(&self, patterns: &[String], tenant: &str) -> Vec<String> {
         if patterns.is_empty() {
             return Vec::new();
         }
@@ -535,65 +596,134 @@ impl Agent {
                 matched.push(tool.name.clone());
             }
         }
-        matched
-    }
-
-    pub fn catalog_tools(&self, tenant: &str) -> Vec<crate::catalog::CatalogTool> {
-        let catalog = self.catalog.read().unwrap();
-        let servers = &self.config.mcp_servers;
-        let mut tools = Vec::new();
-        for (index, (listing, _)) in catalog.servers.iter().enumerate() {
-            let server = &servers[index];
-            let tenant_allowed = match &server.auth {
-                McpAuth::Bearer { tenants, .. } => tenants.iter().any(|t| t == "*" || t == tenant),
-                McpAuth::Static | McpAuth::Grant { .. } => true,
-            };
-            if !tenant_allowed {
-                continue;
-            }
-            if let Some(list) = listing {
-                for t in list.as_ref() {
-                    tools.push(crate::catalog::CatalogTool {
-                        name: t.name.clone(),
-                        server: server.name.clone(),
-                        mcp_name: t.mcp_name.clone(),
-                        description: t.description.clone(),
-                    });
+        if let Some(ref tc) = self.tenant_connectors {
+            let known = tc.known(Some(tenant));
+            for tool in known.tools.iter() {
+                let is_match = patterns.iter().any(|p| {
+                    crate::catalog::pattern_matches(p, &tool.server, &tool.mcp_name, &tool.name)
+                });
+                if is_match && !matched.contains(&tool.name) {
+                    matched.push(tool.name.clone());
                 }
             }
         }
-        for t in catalog.plugin_tools.as_ref() {
-            tools.push(crate::catalog::CatalogTool {
-                name: t.name.clone(),
-                server: String::new(),
-                mcp_name: t.mcp_name.clone(),
-                description: t.description.clone(),
-            });
+        matched
+    }
+
+    pub async fn match_tools(&self, patterns: &[String], tenant: &str) -> Vec<String> {
+        if patterns.is_empty() {
+            return Vec::new();
+        }
+        let mut matched = self.match_tools_sync(patterns, tenant);
+        if let Some(ref tc) = self.tenant_connectors {
+            let platform_names = self.platform_tool_names();
+            let tenant_tools = tc.for_tenant(Some(tenant), &platform_names).await;
+            for tool in tenant_tools.tools.iter() {
+                let is_match = patterns.iter().any(|p| {
+                    crate::catalog::pattern_matches(p, &tool.server, &tool.mcp_name, &tool.name)
+                });
+                if is_match && !matched.contains(&tool.name) {
+                    matched.push(tool.name.clone());
+                }
+            }
+        }
+        matched
+    }
+
+    pub async fn pinned_tools(&self, tenant: &str, profile: &ProfileConfig) -> Vec<String> {
+        let mut pinned = vec!["load_skill".to_string(), "search_tools".to_string()];
+        let matched = self.match_tools(&profile.always_on_tools, tenant).await;
+        for name in matched {
+            if !pinned.contains(&name) {
+                pinned.push(name);
+            }
+        }
+        pinned
+    }
+
+    pub async fn catalog_tools(&self, tenant: &str) -> Vec<crate::catalog::CatalogTool> {
+        let mut tools = Vec::new();
+        {
+            let catalog = self.catalog.read().unwrap();
+            let servers = &self.config.mcp_servers;
+            for (index, (listing, _)) in catalog.servers.iter().enumerate() {
+                let server = &servers[index];
+                let tenant_allowed = match &server.auth {
+                    McpAuth::Bearer { tenants, .. } => {
+                        tenants.iter().any(|t| t == "*" || t == tenant)
+                    }
+                    McpAuth::Static | McpAuth::Grant { .. } => true,
+                };
+                if !tenant_allowed {
+                    continue;
+                }
+                if let Some(list) = listing {
+                    for t in list.as_ref() {
+                        tools.push(crate::catalog::CatalogTool {
+                            name: t.name.clone(),
+                            server: server.name.clone(),
+                            mcp_name: t.mcp_name.clone(),
+                            description: t.description.clone(),
+                        });
+                    }
+                }
+            }
+            for t in catalog.plugin_tools.as_ref() {
+                tools.push(crate::catalog::CatalogTool {
+                    name: t.name.clone(),
+                    server: String::new(),
+                    mcp_name: t.mcp_name.clone(),
+                    description: t.description.clone(),
+                });
+            }
+        }
+        if let Some(ref tc) = self.tenant_connectors {
+            let platform_names = self.platform_tool_names();
+            let tenant_tools = tc.for_tenant(Some(tenant), &platform_names).await;
+            for t in tenant_tools.tools.iter() {
+                tools.push(crate::catalog::CatalogTool {
+                    name: t.name.clone(),
+                    server: t.server.clone(),
+                    mcp_name: t.mcp_name.clone(),
+                    description: t.description.clone(),
+                });
+            }
         }
         tools
     }
 
-    pub fn search_tools(
+    pub async fn search_tools(
         &self,
         query: &str,
         limit: usize,
         tenant: &str,
     ) -> Vec<crate::catalog::SearchHit> {
-        let tools = self.catalog_tools(tenant);
+        let tools = self.catalog_tools(tenant).await;
         let index = crate::catalog::SearchIndex::new(&tools);
         index.search(query, limit)
     }
 
-    pub fn preload_tools(&self, input: &str, profile: &ProfileConfig, tenant: &str) -> Vec<String> {
+    pub async fn preload_tools(
+        &self,
+        input: &str,
+        profile: &ProfileConfig,
+        tenant: &str,
+    ) -> Vec<String> {
         if profile.preload_max_tools == 0 {
             return Vec::new();
         }
-        let tools = self.catalog_tools(tenant);
+        let tools = self.catalog_tools(tenant).await;
         let index = crate::catalog::SearchIndex::new(&tools);
         let lowered = input.to_lowercase();
         let mut chosen = Vec::new();
 
-        for skill in &self.config.skills {
+        let skills = if let Some(ref ts) = self.tenant_skills {
+            ts.for_tenant(Some(tenant)).await
+        } else {
+            Arc::new(self.config.skills.clone())
+        };
+
+        for skill in skills.iter() {
             if skill
                 .keywords
                 .iter()
@@ -621,7 +751,7 @@ impl Agent {
                 if !chosen.contains(&hit.tool.name) {
                     chosen.push(hit.tool.name.clone());
                 }
-                for skill in &self.config.skills {
+                for skill in skills.iter() {
                     let matches_skill = skill.tools.iter().any(|pattern| {
                         crate::catalog::pattern_matches(
                             pattern,
@@ -654,31 +784,64 @@ impl Agent {
     }
 
     /// The tools a run of this tenant's session is offered: the session's active tools.
-    pub fn offered(
+    pub async fn offered(
         &self,
         tenant: &str,
         _profile: &ProfileConfig,
         active_names: &[String],
     ) -> Vec<Arc<OfferedTool>> {
-        let catalog = self.catalog.read().unwrap();
-        let servers = &self.config.mcp_servers;
-
         let mut sets: Vec<Arc<Vec<ToolEntry>>> = Vec::new();
-        sets.push(catalog.meta_tools.clone());
-        if !catalog.plugin_tools.is_empty() {
-            sets.push(catalog.plugin_tools.clone());
-        }
-        for (index, (listing, _)) in catalog.servers.iter().enumerate() {
-            let server = &servers[index];
-            let tenant_allowed = match &server.auth {
-                McpAuth::Bearer { tenants, .. } => tenants.iter().any(|t| t == "*" || t == tenant),
-                McpAuth::Static | McpAuth::Grant { .. } => true,
-            };
-            if !tenant_allowed {
-                continue;
+        {
+            let catalog = self.catalog.read().unwrap();
+            let servers = &self.config.mcp_servers;
+            sets.push(catalog.meta_tools.clone());
+            if !catalog.plugin_tools.is_empty() {
+                sets.push(catalog.plugin_tools.clone());
             }
-            if let Some(tools) = listing {
-                sets.push(tools.clone());
+            for (index, (listing, _)) in catalog.servers.iter().enumerate() {
+                let server = &servers[index];
+                let tenant_allowed = match &server.auth {
+                    McpAuth::Bearer { tenants, .. } => {
+                        tenants.iter().any(|t| t == "*" || t == tenant)
+                    }
+                    McpAuth::Static | McpAuth::Grant { .. } => true,
+                };
+                if !tenant_allowed {
+                    continue;
+                }
+                if let Some(tools) = listing {
+                    sets.push(tools.clone());
+                }
+            }
+        }
+
+        if let Some(ref tc) = self.tenant_connectors {
+            let platform_names = self.platform_tool_names();
+            let tenant_tools = tc.for_tenant(Some(tenant), &platform_names).await;
+            if !tenant_tools.tools.is_empty() {
+                let mut entries = Vec::new();
+                for t in tenant_tools.tools.iter() {
+                    let validator =
+                        jsonschema::validator_for(&t.input_schema).unwrap_or_else(|_| {
+                            jsonschema::validator_for(&serde_json::json!({"type":"object"}))
+                                .unwrap()
+                        });
+                    entries.push(ToolEntry {
+                        name: t.name.clone(),
+                        server: usize::MAX - 3,
+                        mcp_name: t.mcp_name.clone(),
+                        description: t.description.clone(),
+                        schema: t.input_schema.clone(),
+                        validator,
+                        handler: None,
+                        connector: Some(TenantConnectorTarget {
+                            tenant_id: tenant.to_string(),
+                            connector_id: t.connector_id.clone(),
+                            connector_name: t.server.clone(),
+                        }),
+                    });
+                }
+                sets.push(Arc::new(entries));
             }
         }
 
@@ -695,6 +858,61 @@ impl Agent {
             }
         }
         result
+    }
+
+    pub fn render_instructions(
+        &self,
+        profile_name: &str,
+        skills: &[agent_ti_config::SkillConfig],
+    ) -> Vec<String> {
+        let profile = match self.config.profiles.get(profile_name) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        let mut sections: Vec<(String, String, bool)> = self
+            .config
+            .instructions
+            .iter()
+            .map(|s| (s.name.clone(), s.content.clone(), s.tag))
+            .collect();
+        if !skills.is_empty() {
+            sections.push((
+                "skills".into(),
+                agent_ti_config::render_skill_index(skills),
+                true,
+            ));
+        }
+        if let Some(text) = &profile.instructions {
+            sections.push(("profile".into(), text.clone(), true));
+        }
+        for plugin in &self.plugins {
+            for sec in plugin.instructions(profile_name) {
+                sections.push((sec.name, sec.content, sec.tag));
+            }
+        }
+        sections
+            .into_iter()
+            .filter(|(_, text, _)| !text.trim().is_empty())
+            .map(|(key, text, tag)| {
+                if tag {
+                    format!("<{key}>\n{}\n</{key}>", text.trim_end())
+                } else {
+                    text
+                }
+            })
+            .collect()
+    }
+
+    pub fn start_tenant_skills_watcher(
+        self: &Arc<Self>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        if let Some(ref ts) = self.tenant_skills {
+            let ts = ts.clone();
+            tokio::spawn(async move {
+                ts.watch(shutdown).await;
+            });
+        }
     }
 }
 /// One offered tool, keeping its server's listing alive.
