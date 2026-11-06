@@ -132,6 +132,7 @@ async fn before_prompt_answers_without_model_and_model_sees_exchange_in_next_tur
             config_version: "v1".into(),
             origin: json!({"trigger": "user"}),
             metadata: json!({}),
+            child: None,
         })
         .await
         .unwrap();
@@ -139,6 +140,7 @@ async fn before_prompt_answers_without_model_and_model_sees_exchange_in_next_tur
     let plugin = HoursPlugin;
     let turn = Turn {
         text: "What are your opening hours?",
+        note: None,
         agent: "test",
         session_id: &session.session_id,
         tenant_id: &scope.tenant_id,
@@ -182,6 +184,7 @@ async fn before_prompt_answers_without_model_and_model_sees_exchange_in_next_tur
         attempt: 0,
         reply: None,
         cancel_requested: false,
+        child: None,
     };
     let mut history = store.history(&work).await.unwrap();
     history.push(Message::text("user", "Weekends too?"));
@@ -250,6 +253,7 @@ async fn before_prompt_rewrites_input_and_rejects() {
     let plugin = OrdersPlugin;
     let turn_reject = Turn {
         text: "my password is hunter2",
+        note: None,
         agent: "test",
         session_id: "s1",
         tenant_id: "t1",
@@ -263,6 +267,7 @@ async fn before_prompt_rewrites_input_and_rejects() {
 
     let turn_rewrite = Turn {
         text: "Order 42, card 4111111111111111",
+        note: None,
         agent: "test",
         session_id: "s1",
         tenant_id: "t1",
@@ -309,6 +314,7 @@ async fn when_busy_reject_returns_conflict() {
             config_version: "v1".into(),
             origin: json!({"trigger": "user"}),
             metadata: json!({}),
+            child: None,
         })
         .await
         .unwrap();

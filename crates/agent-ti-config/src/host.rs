@@ -17,6 +17,8 @@ pub struct HostConfig {
     pub storage_dir: PathBuf,
     pub auth: AuthConfig,
     pub limits: HostLimits,
+    pub retention: RetentionConfig,
+    pub backup: Option<BackupConfig>,
     pub allowed_origins: Vec<String>,
     pub sources: BTreeMap<String, SourceConfig>,
     pub agents: Vec<AgentLocation>,
@@ -45,6 +47,24 @@ pub struct HostLimits {
     pub max_sessions_per_tenant: u64,
     pub max_streams: usize,
     pub max_parallel_tools: usize,
+    /// How long a plugin's hook may take. A security hook that takes longer refuses; an observer's
+    /// is logged and ignored.
+    pub hook_timeout_ms: u64,
+}
+/// What to remove, by age in days since a session was last active. Unset, nothing is removed.
+#[derive(Clone, Debug, Default)]
+pub struct RetentionConfig {
+    /// A session idle this long loses its events and finished steps; its transcript stays.
+    pub events_days: Option<u64>,
+    /// A session closed and idle this long is removed whole.
+    pub closed_sessions_days: Option<u64>,
+}
+/// Where to write online backups of each agent's store, and how often.
+#[derive(Clone, Debug)]
+pub struct BackupConfig {
+    pub dir: PathBuf,
+    pub interval_minutes: u64,
+    pub keep: usize,
 }
 #[derive(Clone, Debug)]
 pub struct SourceConfig {
@@ -74,6 +94,8 @@ const TOP: &[&str] = &[
     "storage",
     "auth",
     "limits",
+    "retention",
+    "backup",
     "http",
     "sources",
     "agents",
@@ -100,6 +122,7 @@ const LIMITS: &[&str] = &[
     "maxSessionsPerTenant",
     "maxStreams",
     "maxParallelTools",
+    "hookTimeoutMs",
 ];
 pub(crate) fn identifier(s: &str) -> bool {
     !s.is_empty()
@@ -204,12 +227,53 @@ pub fn load_host(path: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<Ho
     let limits = HostLimits {
         max_body_bytes: positive("maxBodyBytes", 1_000_000)? as usize,
         max_concurrent_runs: positive("maxConcurrentRuns", 200)? as usize,
-        max_concurrent_runs_per_tenant: positive("maxConcurrentRunsPerTenant", 16)? as usize,
-        max_queued_per_tenant: positive("maxQueuedPerTenant", 128)?,
+        max_concurrent_runs_per_tenant: positive("maxConcurrentRunsPerTenant", 100)? as usize,
+        max_queued_per_tenant: positive("maxQueuedPerTenant", 1024)?,
         max_queued_per_session: positive("maxQueuedPerSession", 16)?,
         max_sessions_per_tenant: positive("maxSessionsPerTenant", 10_000)?,
-        max_streams: positive("maxStreams", 1000)? as usize,
+        max_streams: positive("maxStreams", 2000)? as usize,
         max_parallel_tools: positive("maxParallelTools", 4)? as usize,
+        hook_timeout_ms: positive("hookTimeoutMs", 10_000)?,
+    };
+    let retained = r.optional_object(
+        top.get("retention"),
+        "retention",
+        &["eventsDays", "closedSessionsDays"],
+    )?;
+    let days = |field: &str| -> Result<Option<u64>> {
+        if !retained.contains_key(field) {
+            return Ok(None);
+        }
+        let at = format!("retention.{field}");
+        let days = r.count(retained.get(field), &at, 0)?;
+        if days == 0 {
+            return r.fail(&at, "must be at least 1");
+        }
+        Ok(Some(days))
+    };
+    let retention = RetentionConfig {
+        events_days: days("eventsDays")?,
+        closed_sessions_days: days("closedSessionsDays")?,
+    };
+    let backup = match top.get("backup") {
+        None => None,
+        Some(_) => {
+            let raw = r.optional_object(
+                top.get("backup"),
+                "backup",
+                &["dir", "intervalMinutes", "keep"],
+            )?;
+            let interval = r.count(raw.get("intervalMinutes"), "backup.intervalMinutes", 60)?;
+            let keep = r.count(raw.get("keep"), "backup.keep", 24)?;
+            if interval == 0 || keep == 0 {
+                return r.fail("backup", "intervalMinutes and keep must be at least 1");
+            }
+            Some(BackupConfig {
+                dir: dir.join(r.string(raw.get("dir"), "backup.dir")?),
+                interval_minutes: interval,
+                keep: keep as usize,
+            })
+        }
     };
     let http = r.optional_object(top.get("http"), "http", &["allowedOrigins"])?;
 
@@ -282,6 +346,8 @@ pub fn load_host(path: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<Ho
         storage_dir,
         auth,
         limits,
+        retention,
+        backup,
         allowed_origins: r.strings(http.get("allowedOrigins"), "http.allowedOrigins")?,
         sources,
         agents,

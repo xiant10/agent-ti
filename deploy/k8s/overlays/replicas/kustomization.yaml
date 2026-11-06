@@ -1,0 +1,13 @@
+# The smoke overlay's agents on three replicas behind ai-gateway-agent, in a namespace of its own.
+# `scripts/test-replicas-k8s.sh` applies this and deletes the namespace afterwards.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: agent-ti-replicas
+resources: [../smoke, gateway.yaml]
+configMapGenerator:
+  - name: agent-ti-gateway
+    files: [config.agent.yaml]
+patches:
+  - target: {kind: StatefulSet, name: agent-ti}
+    patch: |-
+      - {op: replace, path: /spec/replicas, value: 3}

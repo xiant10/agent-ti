@@ -530,6 +530,63 @@ impl GrantBroker {
         )))
     }
 
+    /// Gives a child session its own grant under its parent's, unless it has one, as on a rerun
+    /// after a restart (agent-pi's `spawn`). It holds no secret: its tokens come through this broker.
+    pub async fn spawn(
+        &self,
+        store: &AgentStore,
+        scope: &UserScope,
+        child: &str,
+        parent: &str,
+    ) -> Result<StoredGrant, GrantError> {
+        if let Some(known) = self.grant_of(store, child).await {
+            return Ok(known);
+        }
+        let Some(grant) = self.grant_of(store, parent).await else {
+            return Err(GrantError::Stopped);
+        };
+        let token = self.mint(&grant.grant_id).await?;
+        let claims: Value = token
+            .split('.')
+            .nth(1)
+            .and_then(|p| {
+                use base64::Engine;
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(p)
+                    .ok()
+            })
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let actions: Vec<&str> = claims["scope"]
+            .as_str()
+            .unwrap_or_default()
+            .split(' ')
+            .filter(|a| !a.is_empty())
+            .collect();
+        let audiences = match &claims["aud"] {
+            Value::String(a) => json!([a]),
+            Value::Array(a) => json!(a),
+            _ => json!([]),
+        };
+        let body = json!({"subject_token": token, "actions": actions, "audiences": audiences});
+        let resp = self.service_call("/v1/grants", Some(&body), None).await?;
+        let grant_id = resp
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| GrantError::Unavailable("the auth service returned no grant id".into()))?
+            .to_string();
+        let spawned = StoredGrant {
+            grant_id,
+            parent: None,
+        };
+        self.by_conversation
+            .write()
+            .await
+            .insert(child.to_string(), spawned.clone());
+        let _ = store.set_grant(scope, child, &spawned).await;
+        Ok(spawned)
+    }
+
     /// Releases a session's grant.
     pub async fn release(&self, session_id: &str) {
         let grant = self.by_conversation.write().await.remove(session_id);

@@ -8,7 +8,7 @@ configMapGenerator:
     files: [agent-ti.json]
   - name: agent-ti-agent-ti
     behavior: replace
-    files: [agents/ti-demo/agent.json, agents/ti-demo/base.md, agents/ti-demo/context.md, agents/ti-demo/faq.json]
+    files: [agents/ti-demo/agent.json, agents/ti-demo/base.md, agents/ti-demo/context.md, agents/ti-demo/faq.json, agents/ti-demo/helper.md, guided.md=agents/ti-demo/skills/guided.md, lookup-SKILL.md=agents/ti-demo/skills/lookup/SKILL.md, lookup-flow.json=agents/ti-demo/skills/lookup/flow.json]
   - name: agent-ti-agent-ti-plain
     files: [agents/ti-plain/agent.json, agents/ti-plain/base.md]
   - name: agent-ti-fixture
@@ -26,3 +26,19 @@ patches:
       - op: add
         path: /spec/template/spec/volumes/-
         value: {name: agent-ti-plain, configMap: {name: agent-ti-agent-ti-plain}}
+      # A ConfigMap key can't hold a slash; `items` gives the skill files their folders.
+      - op: replace
+        path: /spec/template/spec/volumes/2
+        value:
+          name: agent-ti
+          configMap:
+            name: agent-ti-agent-ti
+            items:
+              - {key: agent.json, path: agent.json}
+              - {key: base.md, path: base.md}
+              - {key: context.md, path: context.md}
+              - {key: faq.json, path: faq.json}
+              - {key: helper.md, path: helper.md}
+              - {key: guided.md, path: skills/guided.md}
+              - {key: lookup-SKILL.md, path: skills/lookup/SKILL.md}
+              - {key: lookup-flow.json, path: skills/lookup/flow.json}

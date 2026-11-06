@@ -111,6 +111,8 @@ pub struct ModelReply {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionError {
     ContextLimit,
+    /// The provider refused the request as longer than the model's context window.
+    ContextOverflow,
     InvalidToolRound,
     ToolRoundLimit,
     Unavailable,

@@ -24,7 +24,10 @@ try{
  await ready(env.AGENT_TI_FIXTURE_URL+'/healthz');launch();await ready(env.AGENT_TI_URL+'/readyz');await run([]);
  await crash('restart');
  await crash('tool-restart');
- console.log('PASS real process SIGKILL recovery during a model call and during an unsafe tool call');
+ await crash('child-restart');
+ await crash('task-restart');
+ await crash('flow-restart');
+ console.log('PASS real process SIGKILL recovery during a model call, an unsafe tool call, a sub-agent, a task and a flow');
 }finally{
  if(app&&app.exitCode===null){await new Promise(done=>{app.once('exit',done);app.kill('SIGTERM');setTimeout(()=>app.kill('SIGKILL'),3000).unref();});}
  fixture.kill('SIGTERM');rmSync(dir,{recursive:true,force:true});

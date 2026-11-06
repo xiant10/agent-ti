@@ -31,6 +31,7 @@ fn create(s: UserScope, id: &str, key: &str) -> CreateSession {
         config_version: "test".into(),
         origin: json!({"trigger":"user"}),
         metadata: json!({}),
+        child: None,
     }
 }
 

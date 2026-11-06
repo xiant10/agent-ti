@@ -13,6 +13,8 @@ use std::sync::Arc;
 pub enum PromptDecision {
     /// Replace the input; the rewrite is what is stored and what later turns see.
     Input(String),
+    /// Replace the input, and the turn's note when one is given.
+    Rewrite { text: String, note: Option<String> },
     /// Replace input and activate dynamic tools.
     InputAndTools {
         text: String,
@@ -91,6 +93,9 @@ pub struct HostInfo<'a> {
 
 pub struct Turn<'a> {
     pub text: &'a str,
+    /// For the model on this turn and left out of the transcript, as a voice client sends it: that
+    /// the reply is spoken, or what was heard of the last one.
+    pub note: Option<&'a str>,
     pub agent: &'a str,
     pub session_id: &'a str,
     pub tenant_id: &'a str,

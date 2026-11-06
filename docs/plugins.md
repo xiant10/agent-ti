@@ -55,7 +55,7 @@ As in agent-pi: `history.say(text)`, `history.exchange(input, answer)` and `hist
 
 Model and tool hooks run inside journaled steps. After a crash a step's recorded result is reused, so a hook in it may run again for a step whose result was never recorded. These hooks get read-only state and `memo(name, compute)`; `memo` records the value the first time and returns it on replay. A side effect in a hook needs its own idempotency key, because `memo` can't close the gap between doing something and recording it. `before_prompt` decisions are recorded with the command, so a retried `requestId` returns the same decision without running the hook again.
 
-A failing security hook (`authenticate`, `before_tool_call`) fails closed. A failing observer (`after_model_response`, `after_run`) is logged and ignored. Each hook has a timeout.
+A failing security hook (`authenticate`, `before_tool_call`) fails closed. A failing observer (`after_model_response`, `session_created`, `session_closed`) is logged and ignored. Each asynchronous hook has a timeout, `limits.hookTimeoutMs`. `after_run`, `after_tool_call` and `map_event` are synchronous, so they can't be timed out and must not block.
 
 ## Library
 

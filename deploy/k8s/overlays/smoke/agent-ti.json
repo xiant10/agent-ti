@@ -1,6 +1,6 @@
 {
   "port": "${PORT:-18120}",
-  "instanceId": "agent-ti-0",
+  "instanceId": "${AGENT_INSTANCE_ID:-agent-ti-0}",
   "logLevel": "${LOG_LEVEL:-info}",
   "storage": { "kind": "sqlite", "dir": "${AGENT_DATA_DIR:-/data}" },
   "auth": {

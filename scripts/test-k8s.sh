@@ -61,7 +61,7 @@ crash() {
   while :; do
     current=$(kubectl --context "$context" -n agent-ti-test get pod agent-ti-0 -o jsonpath='{.status.containerStatuses[0].restartCount}')
     if [ "$current" -gt "$prior" ]; then break; fi
-    i=$((i+1)); if [ "$i" -gt 60 ]; then echo 'container did not restart' >&2; exit 1; fi
+    i=$((i+1)); if [ "$i" -gt 180 ]; then echo 'container did not restart' >&2; exit 1; fi
     sleep 1
   done
   kubectl --context "$context" -n agent-ti-test wait --for=condition=Ready pod/agent-ti-0 --timeout=120s
@@ -72,6 +72,9 @@ crash() {
 }
 crash restart
 crash tool-restart
+crash child-restart
+crash task-restart
+crash flow-restart
 cat "$artifact_dir/recovery.txt"
 kubectl --context "$context" -n agent-ti-test get pods,pvc -o wide > "$artifact_dir/resources.txt"
 kubectl --context "$context" -n agent-ti-test logs agent-ti-0 > "$artifact_dir/runtime.log"

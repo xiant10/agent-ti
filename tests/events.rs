@@ -116,3 +116,98 @@ fn dropped_deltas_of_the_reply_in_progress_force_a_snapshot() {
             .is_some()
     );
 }
+
+fn commit(hub: &Hub, seq: i64, payload: serde_json::Value) {
+    hub.committed(vec![(
+        "s".into(),
+        DurableEvent {
+            sequence: seq,
+            payload,
+        },
+    )]);
+}
+/// The `speech` events a subscriber from the start would see, as `text@id`.
+fn seen(hub: &Hub) -> Vec<String> {
+    hub.subscribe("s", 0, Some(EventId { seq: 0, delta: 0 }))
+        .deltas
+        .unwrap()
+        .iter()
+        .filter(|d| d.payload["type"] == "speech")
+        .map(|d| {
+            format!(
+                "{}@{}",
+                d.payload["text"].as_str().unwrap_or(""),
+                d.id.render("s")
+            )
+        })
+        .collect()
+}
+#[test]
+fn a_speaking_session_gets_sentences_flushed_before_tools_and_message_end() {
+    let hub = Hub::default();
+    hub.speak("s", 0);
+    commit(&hub, 1, json!({"type":"run.started"}));
+    delta(&hub, "Let me check that for ");
+    delta(&hub, "you. One moment");
+    // The tool call flushes what was said before it.
+    commit(&hub, 2, json!({"type":"tool.started"}));
+    assert_eq!(
+        seen(&hub),
+        ["Let me check that for you.@s:1.3", "One moment@s:1.4"]
+    );
+    commit(&hub, 3, json!({"type":"tool.finished"}));
+    hub.delta(
+        "s",
+        json!({"type":"text.delta","turnId":"t","messageId":"m2","text":"It's **sunny**"}),
+    );
+    commit(
+        &hub,
+        4,
+        json!({"type":"message.end","messageId":"m2","text":"It's **sunny**","stopReason":"stop"}),
+    );
+    let all = seen(&hub);
+    assert!(all.contains(&"It's sunny@s:3.2".to_string()), "{all:?}");
+}
+#[test]
+fn speech_is_dropped_on_abort_and_unstreamed_replies_are_spoken_whole() {
+    let hub = Hub::default();
+    hub.speak("s", 0);
+    commit(&hub, 1, json!({"type":"run.started"}));
+    delta(&hub, "I was about to say");
+    commit(
+        &hub,
+        2,
+        json!({"type":"message.end","messageId":"m","text":"I was about to say","stopReason":"aborted"}),
+    );
+    commit(&hub, 3, json!({"type":"run.finished"}));
+    assert!(seen(&hub).is_empty(), "interrupted speech isn't finished");
+    // A plugin's reply is committed as a text delta and a message end, with no live deltas.
+    commit(
+        &hub,
+        4,
+        json!({"type":"text.delta","messageId":"p","text":"We open at nine. Welcome!"}),
+    );
+    commit(
+        &hub,
+        5,
+        json!({"type":"message.end","messageId":"p","text":"We open at nine. Welcome!","stopReason":"stop","source":"shortcuts"}),
+    );
+    let all = seen(&hub);
+    assert!(
+        all.contains(&"We open at nine.@s:4.1".to_string()),
+        "{all:?}"
+    );
+    assert!(all.contains(&"Welcome!@s:4.2".to_string()), "{all:?}");
+}
+#[test]
+fn a_session_that_does_not_speak_gets_no_speech() {
+    let hub = Hub::default();
+    commit(&hub, 1, json!({"type":"run.started"}));
+    delta(&hub, "Hello there. How are you?");
+    commit(
+        &hub,
+        2,
+        json!({"type":"message.end","messageId":"m","text":"Hello there. How are you?","stopReason":"stop"}),
+    );
+    assert!(seen(&hub).is_empty());
+}

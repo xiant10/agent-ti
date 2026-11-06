@@ -29,6 +29,15 @@ Everything else, including what clients see, matches agent-pi, so the gateway, W
 | Reading config | Local files | Every config read goes through a config source: local files, or a remote config API | Agents can be deployed without rebuilding an image or ConfigMap |
 | Tool rounds | Bounded by pi-durable | `limits.maxToolRounds` in `agent.json` | The loop is ours, so its bound is a setting |
 | Parallel tool calls | pi-durable's | `limits.maxParallelTools` in the host file | Same reason; a process limit, since agents share the process |
+| When compaction is checked | Before every model request | Before each run; a run's own tool rounds are bounded by the byte budget, which drops whole old turns of the request if it must | The run's history is built once and its steps are journaled against it; a mid-run cut would change recorded requests |
+| How a parent's tool waits for its child | Durable's submission wait | Polls the child's command outcome, every 20–250 ms | No in-process wait on another session's command yet; the poll reads one indexed row |
+| Background tasks' engine | pi-durable anchor and delivery tasks | `tasks` and `task_messages` tables and a per-agent supervisor, looking every 200 ms or when woken | There's no durable task engine here; the behavior in `async-tasks.md` is the specification. A deadline can be enforced up to one tick late |
+| When a parent is offered `task_send`, `task_list`, `task_stop` | From its first task on | From the start, on an agent with a background sub-agent | Pinned tools come from the profile, not per session; they cost a little in every request, and refuse nothing |
+| A flow's tool calls after a crash | `load_skill` is `replay: safe`, so the whole flow runs again | Each of a flow's tool calls is a journaled step: a finished one is reused, and one cut off comes back to the flow as `interrupted` | Every MCP tool is unsafe to repeat (see [durability](#durability)), and a flow can call one that writes |
+| A flow's `extract.pattern` | A JavaScript `RegExp`, compiled when it runs | The `regex` crate, checked when the skill is read: no lookaround or backreferences, and a pattern that uses them fails its checks | No backtracking in a process tenants share; a bad pattern shows up at `skills.checkFlow`, not on a user's turn |
+| Flow traces kept | The latest and nine before it | The latest | Nothing reads the older ones |
+| How `usage` is broken down | By model and tool | Input and output tokens: the session's own under its profile's model, foreground children's under `tools.subagents`. Counted as each model call is journaled, so a failed or cancelled run keeps what its finished calls spent; a call cut off mid-stream counts nothing, since providers report usage at the end | The totals clients show and `maxUnattendedTokens` need these; per-model detail and cost wait until something reads them |
+| Compaction in the transcript | A `{role: "compaction"}` line in `session.messages` | None: the transcript lists messages only, and the `compaction` events mark it | Not yet built |
 | Paths in `agent.json` | Any path relative to the file | Within the agent's config snapshot: for a local file, the app directory (`<app>` for `<app>/config/agent.json`) | A remote snapshot can't name local files; local agents behave the same way, and agent-pi's layout still resolves |
 
 Everything not in this table should behave as agent-pi does. A new difference needs a row here with its reason.
@@ -110,9 +119,9 @@ The same transport, methods and events as agent-pi's design, so a client can't t
 
 - `POST /agent` takes one JSON-RPC request. `Agent-Session-Id` (or `params.sessionId`) selects the session. With `Accept: text/event-stream` on `session.prompt` and `session.interrupt`, the response is that run's SSE stream ending in the JSON-RPC result. Otherwise it's JSON.
 - `GET /agent` with `Agent-Session-Id` is the session's event stream. `Last-Event-ID` resumes from durable events in SQLite, so a resume survives a restart. An unknown or expired cursor starts with a `snapshot`.
-- `DELETE /agent` closes the session.
-- Methods: `session.create`, `list`, `get`, `messages`, `update`, `prompt`, `steer`, `interrupt`, `cancel`, `retry`, `close`, `skills.list`, plus plugin `rpc` methods, with agent-pi's arguments and results.
-- Events: `snapshot`, `run.started`, `run.finished`, `text.delta`, `speech`, `thinking.delta`, `message.end`, `tool.started`, `tool.finished`, `tools.active`, `task.updated`, `inbox`, `submission`, `retry`, `compaction`, `error`, with agent-pi's fields. `text.delta.offset` counts UTF-16 code units, as JavaScript clients expect.
+- `DELETE /agent` closes the session: a 204, or 421 on the wrong replica.
+- Methods: `session.create`, `list`, `get`, `messages`, `update`, `prompt`, `steer`, `interrupt`, `cancel`, `retry`, `close`, `skills.list`, `skills.get`, `skills.tools`, `skills.checkFlow`, plus plugin `rpc` methods, with agent-pi's arguments and results.
+- Events: `snapshot`, `run.started`, `run.finished`, `text.delta`, `speech`, `thinking.delta`, `message.end`, `tool.started`, `tool.finished`, `tools.active`, `task.updated`, `flow.updated`, `inbox`, `submission`, `retry`, `compaction`, `error`, with agent-pi's fields. `text.delta.offset` counts UTF-16 code units, as JavaScript clients expect.
 
 Each agent is served at `/agents/{name}/agent` and `/agents/{name}/v1/runtime`, each looking like a single agent-pi endpoint to the gateway. Plain `/agent` serves the host's default agent.
 
@@ -153,7 +162,8 @@ Copied from agent-pi:
 - **Few tools per request** and **tool preloading**.
 - **Prompt cache:** a stable prefix; plugin context added by `before_model_request` is per-request and not stored.
 - **Speech segmentation on the server:** `speech` events carry complete sentences, markdown stripped, flushed at tool start and run end.
-- **`consult_expert`:** the voice profile's fast model can hand a hard question to a child run on the expert model, as in agent-pi's [delegation](../../agent-pi/docs/delegation.md). Sub-agents, background tasks and flows follow agent-pi's documents once the parent loop is complete.
+- **`consult_expert`:** the voice profile's fast model can hand a hard question to a child run on the expert model, as in agent-pi's [delegation](../../agent-pi/docs/delegation.md). Sub-agents and background tasks follow agent-pi's documents.
+- **Flows:** `load_skill` with `query` runs a skill's deterministic `flow.json` without the model, cutting several tool-calling rounds to one, as in agent-pi.
 
 ## R5: multi-user and scaling
 
@@ -200,4 +210,3 @@ These ideas from the first version are kept as options. None of them shapes the 
 - **Versioned agent publication:** digest-pinned agent revisions published through an API, with sessions pinned to a revision. Useful if agents are ever edited online; agent-pi's model (files in the image, a rollout to change them, tenant changes through agent-control) is enough today.
 - **PostgreSQL with leases**, so any replica can run any session. Needs a gateway and contract change; sticky SQLite replicas work for now.
 - **Wasm plugins** for tenant-supplied code.
-- **Capacity targets.** Measure first with `t10-perf`, then write numbers down.

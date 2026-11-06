@@ -58,12 +58,63 @@ pub struct Agent {
     pub tenant_skills: Option<Arc<crate::tenant_skills::TenantSkills>>,
     pub tenant_connectors: Option<Arc<crate::tenant_connectors::TenantConnectors>>,
     pub turn_pins: Arc<crate::tenant_skills::TurnPins>,
+    /// Wakes the background-task supervisor (`tasks::supervise`).
+    pub task_wake: tokio::sync::Notify,
+    /// Children running per session (`children::Slot`).
+    pub children: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    /// Sessions with a background compaction running.
+    pub compacting: std::sync::Mutex<std::collections::HashSet<String>>,
     catalog: RwLock<Catalog>,
 }
 fn pattern(glob: &str, text: &str) -> bool {
     crate::catalog::glob_matches(glob, text)
 }
 
+pub const EXPERT_TOOL: &str = "consult_expert";
+pub const SUBAGENT_PREFIX: &str = "agent_";
+/// A tool that runs a child session, with its one string parameter.
+fn child_tool(name: &str, description: &str, param: &str, about: &str) -> ToolEntry {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": { param: { "type": "string", "description": about } },
+        "required": [param]
+    });
+    ToolEntry {
+        name: name.into(),
+        server: usize::MAX - 4,
+        mcp_name: name.into(),
+        description: description.into(),
+        validator: jsonschema::validator_for(&schema).unwrap(),
+        schema,
+        handler: None,
+        connector: None,
+    }
+}
+/// A background-task tool with string parameters, and optionally `urgent`.
+fn task_tool(name: &str, description: &str, params: &[(&str, &str)], urgent: bool) -> ToolEntry {
+    let mut properties = serde_json::Map::new();
+    for (param, about) in params {
+        properties.insert(
+            (*param).into(),
+            serde_json::json!({"type":"string","description":about}),
+        );
+    }
+    if urgent {
+        properties.insert("urgent".into(), serde_json::json!({"type":"boolean","description":"Join the work it is doing now, after its current tool round. Otherwise this waits for its turn to end."}));
+    }
+    let required: Vec<&str> = params.iter().map(|(p, _)| *p).collect();
+    let schema = serde_json::json!({"type":"object","properties":properties,"required":required});
+    ToolEntry {
+        name: name.into(),
+        server: usize::MAX - 5,
+        mcp_name: name.into(),
+        description: description.into(),
+        validator: jsonschema::validator_for(&schema).unwrap(),
+        schema,
+        handler: None,
+        connector: None,
+    }
+}
 fn meta_tools() -> Vec<ToolEntry> {
     let load_skill_schema = serde_json::json!({
         "type": "object",
@@ -143,6 +194,7 @@ impl Agent {
             "session.list",
             "session.get",
             "session.messages",
+            "session.tool",
             "session.update",
             "session.close",
             "session.prompt",
@@ -249,7 +301,55 @@ impl Agent {
             .map_err(|e| format!("{name}: instance ID: {e:?}"))?;
         let version = config.bundle.clone().unwrap_or_else(|| snapshot.version());
         let servers = config.mcp_servers.iter().map(|_| (None, None)).collect();
-        let meta = Arc::new(meta_tools());
+        let mut meta = meta_tools();
+        if config.profiles.values().any(|p| p.expert.is_some()) {
+            meta.push(child_tool(
+                EXPERT_TOOL,
+                "Ask a slower, stronger reasoning model a hard question: multi-step analysis, planning, or a decision with trade-offs. Include the facts it needs. Returns its conclusion. Do not use it for simple lookups.",
+                "question",
+                "The question, with every fact needed to answer it.",
+            ));
+        }
+        // Each sub-agent is a catalog tool, so skills, search, preload and `alwaysOnTools` reach
+        // it as any tool; its code is in the worker.
+        for sub in &config.subagents {
+            plugin_tools.push(child_tool(
+                &format!("{SUBAGENT_PREFIX}{}", sub.name),
+                &sub.description,
+                "task",
+                "The task, with everything the agent needs: it cannot see this conversation.",
+            ));
+        }
+        if config.subagents.iter().any(|s| s.background) {
+            let task_id = ("taskId", "The task, such as t1.");
+            meta.push(task_tool(crate::tasks::SEND_TOOL, "Send a message to a background task: the answer to its question, or more work. Its reply arrives as a report.", &[task_id, ("message", "The whole message. The task cannot see this conversation.")], true));
+            meta.push(task_tool(
+                crate::tasks::LIST_TOOL,
+                "List this session's background tasks, with each one's status and last report.",
+                &[],
+                false,
+            ));
+            meta.push(task_tool(
+                crate::tasks::STOP_TOOL,
+                "End a background task and its work. It cannot be resumed.",
+                &[task_id],
+                false,
+            ));
+            let mut note = task_tool(
+                crate::tasks::NOTE_TOOL,
+                "Tell the agent that started you something while you keep working. It reads this at its next step, unless urgent.",
+                &[(
+                    "message",
+                    "What it should know. It cannot see this conversation.",
+                )],
+                true,
+            );
+            note.schema["properties"]["urgent"]["description"] =
+                serde_json::json!("Interrupt it now. Only for something that changes its plan.");
+            note.validator = jsonschema::validator_for(&note.schema).unwrap();
+            meta.push(note);
+        }
+        let meta = Arc::new(meta);
         let grants = config.grants.as_ref().map(|g| {
             Arc::new(crate::grants::GrantBroker::new(
                 g.clone(),
@@ -308,6 +408,9 @@ impl Agent {
             tenant_skills,
             tenant_connectors,
             turn_pins,
+            compacting: Default::default(),
+            children: Default::default(),
+            task_wake: Default::default(),
             config,
         })
     }
@@ -632,6 +735,14 @@ impl Agent {
 
     pub async fn pinned_tools(&self, tenant: &str, profile: &ProfileConfig) -> Vec<String> {
         let mut pinned = vec!["load_skill".to_string(), "search_tools".to_string()];
+        if profile.expert.is_some() {
+            pinned.push(EXPERT_TOOL.to_string());
+        }
+        // agent-pi offers these from a session's first task on; here, from the start, so that
+        // nothing needs to change a session's pinned set.
+        if self.has_background_tasks() {
+            pinned.extend(crate::tasks::PARENT_TOOLS.iter().map(|t| t.to_string()));
+        }
         let matched = self.match_tools(&profile.always_on_tools, tenant).await;
         for name in matched {
             if !pinned.contains(&name) {
@@ -860,10 +971,42 @@ impl Agent {
         result
     }
 
+    pub fn has_background_tasks(&self) -> bool {
+        self.config.subagents.iter().any(|s| s.background)
+    }
+    /// A child's instructions: the agent's sections without the `profile` one, so a consulted
+    /// expert doesn't get "short spoken sentences", then the child's own (agent-pi's delegation).
+    pub fn render_child_instructions(
+        &self,
+        profile_name: &str,
+        skills: &[agent_ti_config::SkillConfig],
+        own: Option<&str>,
+        task: bool,
+    ) -> Vec<String> {
+        let mut rendered = self.render_sections(profile_name, skills, false);
+        if task {
+            rendered.push(format!(
+                "<tasks>\n{}\n</tasks>",
+                crate::tasks::CHILD_SECTION
+            ));
+        }
+        if let Some(own) = own.filter(|t| !t.trim().is_empty()) {
+            rendered.push(own.to_owned());
+        }
+        rendered
+    }
     pub fn render_instructions(
         &self,
         profile_name: &str,
         skills: &[agent_ti_config::SkillConfig],
+    ) -> Vec<String> {
+        self.render_sections(profile_name, skills, true)
+    }
+    fn render_sections(
+        &self,
+        profile_name: &str,
+        skills: &[agent_ti_config::SkillConfig],
+        with_profile: bool,
     ) -> Vec<String> {
         let profile = match self.config.profiles.get(profile_name) {
             Some(p) => p,
@@ -882,9 +1025,13 @@ impl Agent {
                 true,
             ));
         }
-        if let Some(text) = &profile.instructions {
+        if let Some(text) = profile.instructions.as_ref().filter(|_| with_profile) {
             sections.push(("profile".into(), text.clone(), true));
         }
+        if with_profile && self.has_background_tasks() {
+            sections.push(("tasks".into(), crate::tasks::PARENT_SECTION.into(), true));
+        }
+        // Plugin sections carry policy, so they render in a child too.
         for plugin in &self.plugins {
             for sec in plugin.instructions(profile_name) {
                 sections.push((sec.name, sec.content, sec.tag));

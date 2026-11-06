@@ -5,6 +5,18 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, LazyLock};
 
+/// A hook's result, or an error if it takes longer than `limit`. What an error means is up to the
+/// caller: a security hook refuses, an observer's is logged.
+pub async fn within<T>(
+    limit: std::time::Duration,
+    hook: &str,
+    run: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::time::timeout(limit, run)
+        .await
+        .unwrap_or_else(|_| Err(format!("{hook} took more than {} ms", limit.as_millis())))
+}
+
 /// The plugins compiled into this binary. A product with plugins of its own builds its own binary
 /// with a catalog that extends this one.
 pub fn catalog(name: &str) -> Option<Factory> {
@@ -43,11 +55,15 @@ impl Plugin for Guardrails {
         turn: &'a Turn<'a>,
     ) -> BoxFuture<'a, Result<Option<PromptDecision>, String>> {
         Box::pin(async move {
-            if !CARD.is_match(turn.text) {
+            let in_note = turn.note.is_some_and(|n| CARD.is_match(n));
+            if !CARD.is_match(turn.text) && !in_note {
                 return Ok(None);
             }
             tracing::info!(session_id = turn.session_id, "guardrails.redacted");
-            Ok(Some(PromptDecision::Input(redact(turn.text))))
+            Ok(Some(PromptDecision::Rewrite {
+                text: redact(turn.text),
+                note: turn.note.filter(|_| in_note).map(redact),
+            }))
         })
     }
     fn after_tool_call(&self, _call: &ToolCall, result: ToolOutcome) -> ToolOutcome {

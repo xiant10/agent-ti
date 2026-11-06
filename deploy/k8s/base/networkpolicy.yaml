@@ -9,5 +9,7 @@ spec:
     - from:
         - podSelector: {matchLabels: {app.kubernetes.io/name: ai-gateway-agent}}
         - podSelector: {matchLabels: {app.kubernetes.io/name: t10-agent-control}}
+        # The voice app finds a session's replica by its ID and calls it directly.
+        - podSelector: {matchLabels: {app.kubernetes.io/name: t10-livekit-agent}}
         - podSelector: {matchLabels: {app.kubernetes.io/name: agent-ti-test}}
       ports: [{port: 18120, protocol: TCP}]

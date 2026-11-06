@@ -364,6 +364,7 @@ async fn test_offline_user_recovery_and_grant_token_separation() {
             config_version: "v1".into(),
             origin: json!({"trigger": "user"}),
             metadata: json!({}),
+            child: None,
         })
         .await
         .unwrap();

@@ -40,6 +40,17 @@ spec:
           ports: [{name: http, containerPort: 18120}]
           envFrom:
             - secretRef: {name: agent-ti}
+          env:
+            # A replica's name, and so its sessions' IDs: agent-ti-0, agent-ti-1, ...
+            - name: AGENT_INSTANCE_ID
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            # Tenant skills and connectors (step 7), as agent-pi's assistant has them.
+            - {name: AUTH_URL, value: "http://auth-server.t10.svc.cluster.local:18000"}
+            - {name: AGENT_CONTROL_URL, value: "http://t10-agent-control.t10.svc.cluster.local:18010"}
+            - {name: TOOL_GATEWAY_URL, value: "http://ai-gateway-tools.t10.svc.cluster.local:18095"}
+            - {name: AGENT_GRANTS_CLIENT_ID, value: "agent-ti"}
+            - {name: GRANT_ACTIONS, value: "agent:use,work:read,work:write,knowledge:read"}
+            - {name: GRANT_AUDIENCES, value: "agent-ti,t10-collab,t10-knowledge,ai-gateway-tools"}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

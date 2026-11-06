@@ -17,6 +17,9 @@ use std::{
 };
 
 mod sessions;
+pub use sessions::{
+    Ended, Pruned, SessionUsage, Settled, Summary, TaskMessage, TaskRow, UnattendedBudget,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserScope {
@@ -40,6 +43,9 @@ pub struct Session {
     pub busy: bool,
     /// Commands parked after `restartLimit` restarts without progress.
     pub parked: i64,
+    /// For a child session: the session whose tool call runs it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DurableEvent {
@@ -86,6 +92,8 @@ pub struct Work {
     pub reply: Option<Reply>,
     /// Cancelled before a restart; finish it without running.
     pub cancel_requested: bool,
+    /// A child session's spec, for a command of one.
+    pub child: Option<Value>,
 }
 /// A command the scheduler may claim: the oldest of its session, which has nothing running.
 #[derive(Clone, Debug)]
@@ -94,6 +102,10 @@ pub struct Candidate {
     pub user_id: String,
     pub command_id: String,
     pub ordinal: i64,
+    /// A child session's command, which a parent's run waits for, so it is outside run limits.
+    pub child: bool,
+    /// A background task's child: within process capacity and `maxBackgroundRunsPerUser` instead.
+    pub task: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreError {
@@ -149,6 +161,13 @@ pub struct CreateSession {
     pub config_version: String,
     pub origin: Value,
     pub metadata: Value,
+    /// Set for a child session, which isn't listed and doesn't count toward session limits.
+    pub child: Option<Child>,
+}
+#[derive(Clone, Debug)]
+pub struct Child {
+    pub parent: String,
+    pub spec: Value,
 }
 #[derive(Clone)]
 pub struct Submit {
@@ -219,8 +238,11 @@ pub fn digest(value: &impl Serialize) -> String {
 
 /// Called after each commit with the events it wrote, in order, by session.
 pub type CommitListener = Box<dyn Fn(Vec<(String, DurableEvent)>) + Send + Sync>;
+/// Connections for reads, beside the one writer. Backups and streams resuming use them too.
+const READ_CONNECTIONS: u32 = 4;
 pub struct AgentStore {
     pool: SqlitePool,
+    readers: SqlitePool,
     listener: std::sync::OnceLock<CommitListener>,
     agent: String,
     limits: StoreLimits,
@@ -284,8 +306,20 @@ impl AgentStore {
             pool.close().await;
             return Err(StoreError::WrongAgent(owner));
         }
+        // Readers don't wait for the writer under WAL, or for each other.
+        let readers = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(READ_CONNECTIONS)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .read_only(true)
+                    .busy_timeout(Duration::from_secs(5)),
+            )
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
         Ok(Self {
             pool,
+            readers,
             listener: std::sync::OnceLock::new(),
             agent: agent.into(),
             limits,
@@ -323,6 +357,7 @@ impl AgentStore {
             .map_err(|_| StoreError::Unavailable)
     }
     pub async fn close(self) {
+        self.readers.close().await;
         self.pool.close().await;
     }
 }

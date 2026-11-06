@@ -92,6 +92,8 @@ Comparison between live Kubernetes pods `agent-ti-0` and `agent-pi-0` deployed i
 
 With agent-ti demonstrating ~80x memory savings and significantly lower turn completion latency, Step 2a confirms proceeding to the remaining phases.
 
+Review note (2026-11-05, later): this is an idle-memory reading and one turn, not the planned `t10-perf` text scenario at rising concurrency, and the 3 s against 10 s compares one turn each on a real model. It shows the direction but doesn't replace the measurement, which step 12's load test still has to make.
+
 ## 2026-11-05: step 3, full plugin hooks and state
 
 The runtime now supports the complete plugin hook suite matching agent-pi:
@@ -171,35 +173,6 @@ The runtime now implements dynamic tool discovery, activation, BM25 indexing, an
 | Parent `node contracts/agent/conformance.ts agent-ti` | **19 of 20 passed** (all 16 required + 3 optional capabilities: `steer`, `interrupt`, and `retry`; only `voice` skipped) |
 | `node agent-ti/scripts/test-local.mjs` | Full HTTP smoke, live streaming, recovery during model call SIGKILL, and recovery during unsafe tool call SIGKILL passed |
 
-## 2026-11-05: step 7, tenant skills from t10-agent-control and tenant connectors
-
-The runtime now implements tenant skills, author drafts, reference files, turn pinning, and tenant connectors:
-- **Tenant Skills & Control integration** (`crates/agent-ti-config` & `src/tenant_skills.rs`):
-  - Fetches tenant skills and workflow overrides from `t10-agent-control` (`GET /v1/runtime/skills?tenant={tenant}`) with ETag caching (10s fresh, 5m stale fallback, 304 Not Modified).
-  - Background change feed watcher follows `/v1/runtime/skills/changes?after={cursor}` and invalidates the tenant cache on publication.
-  - Author drafts support: test sessions with `session.metadata.skillDraft` resolve draft skill definitions via `/v1/runtime/skills/draft`.
-  - Turn pinning (`TurnPins`): skills available at turn start remain pinned in memory for the turn duration, preventing mid-turn skill changes from affecting running turns.
-  - Custom tenant skill reference files: `skill.files` validated and served by `load_skill` via `file` parameter.
-  - Built-in skills support `flow.json` alongside `SKILL.md`.
-- **Tenant Connectors** (`src/tenant_connectors.rs` & `src/agents.rs`):
-  - Fetches published connector tools from `t10-agent-control` (`GET /v1/runtime/connectors?tenant={tenant}`) with ETag caching and change feed invalidation.
-  - Connector tool scoping: exposed as `{connector_name}_{tool_name}` to avoid collisions with platform tools.
-  - Complete tenant isolation: two tenants' connectors never mix or leak.
-  - Gateway dispatch under grant auth: connector tools are dispatched to `{gatewayUrl}/mcp/connector/{connectorId}` using a short-lived token minted by `GrantBroker`.
-- **Worker & Server RPC integration** (`src/worker.rs` & `src/server.rs`):
-  - Dynamic tool matching, preloading, and active set management incorporates tenant connector tools.
-  - System prompt `<skills>` dynamically renders pinned tenant skills and built-in skills.
-  - `skills.list`, `skills.get`, and `skills.tools` RPC endpoints return tenant-aware skills and tools.
-
-| Check | Observed result |
-| --- | --- |
-| `cargo test --workspace --locked` | **46 tests passed** (including unit tests in `agent-ti-config` and integration tests in `tests/tenant_skills.rs` and `tests/tenant_connectors.rs`) |
-| `cargo fmt --all -- --check` | Passed |
-| `cargo clippy --workspace --all-targets --locked -- -D warnings` | Passed with 0 warnings |
-| `cargo doc --workspace --no-deps --locked` | Passed |
-| Parent `node contracts/agent/conformance.ts agent-ti` | **19 of 20 passed** (all 16 required + 3 optional capabilities: `steer`, `interrupt`, and `retry`; only `voice` skipped) |
-| `node agent-ti/scripts/test-local.mjs` | Full HTTP smoke, live streaming, recovery during model call SIGKILL, and recovery during unsafe tool call SIGKILL passed |
-
 ## 2026-11-05: step 6, grants from auth-server for auth: "grant" MCP servers; Streamable HTTP MCP with list_changed
 
 The runtime now implements auth grants, offline recovery, MCP grant authentication, and streamable HTTP MCP dynamic re-listing:
@@ -261,4 +234,208 @@ The runtime now implements tenant skills, author drafts, reference files, turn p
 | Parent `node contracts/agent/conformance.ts agent-ti` | **19 of 20 passed** (all 16 required + 3 optional capabilities: `steer`, `interrupt`, and `retry`; only `voice` skipped) |
 | `node agent-ti/scripts/test-local.mjs` | Full HTTP smoke, live streaming, recovery during model call SIGKILL, and recovery during unsafe tool call SIGKILL passed |
 
+## 2026-11-05: step 8 (part), speech events, the voice profile and `note`
 
+Ported from agent-pi:
+
+- **Speech segmentation** (`src/speech.rs`, from `events/speech.ts`): sentences at `.!?;` plus whitespace, CJK `。！？；`, or line breaks; segments under 12 characters wait; a sentence over 220 is cut at its last clause break, else its last space; markdown is stripped per segment. agent-pi's three unit tests pass in Rust, plus two more.
+- **`speech` events** (`src/events.rs`): a session whose profile sets `speech` gets `{type, text, index}` events from memory, like text deltas, in the same ID order and resume ring. Buffered text is flushed before `tool.started`, `message.end` and `run.finished`; an aborted message's buffered text is dropped. A plugin's reply, and a reply recovered after a restart that streamed no deltas in this process, are spoken whole from their committed events.
+- **`note`** on `session.prompt`: given to the model ahead of the input as `<turn-note>…</turn-note>`, left out of `session.messages`, part of the request fingerprint, and passed to `before_prompt` (`Turn.note`). `PromptDecision::Rewrite` can replace both; `guardrails` redacts card numbers in the note, as in agent-pi.
+- **`voice` capability** in the manifest and on every session, as agent-pi's `capabilitiesOf` lists it.
+- **Ti's `voice` profile** (`deploy/k8s/base/agents/ti/voice.md`, agent-pi's voice prompt without `consult_expert`), and an ingress rule for `t10-livekit-agent`.
+
+| Check | Observed result |
+| --- | --- |
+| `cargo test --workspace --locked` | 60 passed |
+| `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings` | Passed |
+| Parent `node contracts/agent/conformance.ts agent-ti` | **20 of 20 passed**, including `capability voice` |
+| `node agent-ti/scripts/test-local.mjs` | HTTP smoke (now with `note`: model input, redaction, transcript, a non-string note answers 400) and both SIGKILL recoveries passed |
+| Local cluster, namespace `t10`, `qwen3.5-flash`, `sample-member` token, `voice` profile | First `text.delta` 1.35 s and first `speech` 1.66 s after the prompt; three sentence events matching `message.end`; transcript without the note |
+
+Not done: a call through `t10-livekit-agent`. Its tokens come from grants whose audiences are `agent-pi` and `agent-sales` (`auth-server/clients.yaml`), and agent-ti accepts `t10`. `auth-server/docs/agent-identity.md` asks for per-exchange audience narrowing before a third audience is added.
+
+## 2026-11-05: step 7 on the local cluster
+
+Ti was given agent-pi's step 7 settings (`tenantSkills`, `tenantConnectors`, `grants`, the same environment as the assistant) and its own runtime account: `agent-ti` in `auth-server/clients.yaml` (`optional: true`, audiences `agent-ti`, collab, knowledge and the tool gateway) with `AGENT_TI_SECRET` in the setup secret. Control's runtime directory maps it to the `ti` pool through the pool's `agent-ti` audience. `scripts/step7-cluster.mjs`, run against namespace `t10` with `qwen3.5-flash`:
+
+| Check | Observed result |
+| --- | --- |
+| A custom skill published for Ti by `sample-acme-admin` | In an Acme member's `skills.list` 62–72 ms after the publish; the model loaded it and answered with its code |
+| A second version | Used by the next turn, 3.6 s later |
+| Globex (`sample-multi`) | Never saw the skill |
+| A connector to `mcp-fixture`'s `/open/mcp`, published with `echo` for agent `ti` | Offered to Acme, activated by a skill naming `<connector>:*`, called through `ai-gateway-tools` on Ti's grant, no error |
+| Globex | Not offered the tool; the model said it couldn't call it |
+
+Found on the way: with nothing else in Ti's catalog, BM25 scores a lone connector tool below `preload.minScore`, so it's reached through a skill or `search_tools`, as agent-pi's formula gives too. The script removes what it publishes.
+
+## 2026-11-05: step 9, compaction
+
+| Check | Observed result |
+| --- | --- |
+| `cargo test --workspace --locked` | 66 passed, including the cut (keeps recent context, never splits a tool round), thresholds, the summarizer's transcript, overflow patterns, and the store's furthest-cut rule |
+| Smoke, `ti-plain` with a 3,000-token window, `reserveTokens` 500, `keepRecentTokens` 300 | Twelve 600-character turns: request sizes 710, 1,996, 2,842, then 2,847–2,851 to the end; the last request starts with the summary; `compaction` start and end events; `session.messages` still has all 24 messages |
+| Smoke, an overflow | The fixture's `maximum context length` 400 on a long request: the run compacted and answered on its second request |
+| `node agent-ti/scripts/test-local.mjs`, `./scripts/test-k8s.sh` | Both pass, with both SIGKILL recoveries |
+| Contract | 20 of 20 |
+
+Not checked with a real model: Ti's 128,000-token window makes a long enough session impractical by hand. The summarizer prompt is pi-durable's, unchanged.
+
+## 2026-11-05: step 10a, `consult_expert` and sub-agents
+
+| Check | Observed result |
+| --- | --- |
+| `cargo test --workspace --locked` | 67 passed, including the `subagents` and `expert` config fields and their defaults |
+| Smoke, `ti-demo` with sub-agent `helper` (no tools, its own instructions) and an `expert` on the chat profile | `agent_helper` answered through a child session: the child's request carried `helper.md` and no tools; `consult_expert`'s child was offered the parent's tools without `consult_expert` or `agent_helper`. The parent's `session.get` lists both children; neither is in `session.list`; a child can be read by its owner, not by another user, and `session.prompt` on it answers 404 |
+| Smoke, cancel | Cancelling the parent while its child's model call ran left the child idle within 4 s |
+| Crash, `scripts/test-local.mjs` and `./scripts/test-k8s.sh` | SIGKILL while the child's model call was in flight: after the restart the parent answered with the child's reply, one child, and the child's transcript one exchange |
+| Contract | 20 of 20 |
+| Local cluster, namespace `t10` | Deployed; Ti declares no sub-agents, so this is the step 7 check passing again on the new image |
+
+## 2026-11-05: step 10b, background tasks
+
+Smoke, against `ti-demo` with background sub-agents `scout` and `slowpoke` (500 ms deadline) and a `quiet` profile (`taskReports: "note"`):
+
+| Check | Observed result |
+| --- | --- |
+| Start and report | The tool returned at once; `task.updated` working then idle; the child's answer woke the parent as `<task_report id="t1" name="scout" status="idle">`; the child had only `task_note`, each side had its `tasks` section; `session.get` shows the task and `session.messages` a `task` line |
+| `task_send`, `task_list`, `task_stop` | A send started the child's next run, which reported; the list read the last report; after a stop, a send is an error the model reads |
+| `task_note` | Reached the transcript as a `task` line of kind `note` with no run of its own |
+| `taskReports: "note"` | No run; the next request carried the report |
+| Deadline | The run was stopped; the report said it ran out of time; status `failed` |
+| Interrupt | A report queued behind a busy parent, withdrawn by an interrupt, came back as one note; the model answered the interrupting input, and no run started for the report |
+| `maxBackgroundRunsPerUser` | With three children working, a fourth waited, and its 500 ms deadline waited with it |
+| `maxTasksPerSession`, cancel | A fourth live task was refused; a plain cancel left tasks working; `tasks: true` stopped them |
+| Crash, local and Kubernetes | SIGKILL with the parent idle and the child's model call in flight: the supervisor resumed and the parent got one report |
+| Store tests | The unattended budget turns reports into notes until a user speaks; a rerun finds the same task; a note waits for a boundary |
+| `cargo test --workspace --locked` | 71 passed |
+| `node agent-ti/scripts/test-local.mjs` | Passed 4 runs of 4 |
+| `./scripts/test-k8s.sh` | Passed 5 runs of 5 after the fix, on one volume |
+| Local cluster, namespace `t10` | Deployed; Ti declares no sub-agents, so this is the step 7 check passing again on the new image |
+| Contract | 20 of 20 |
+
+Found by repeating the Kubernetes suite: a note placed just after a run was claimed followed the run's input in its history, so the model answered the report instead of the person. It appeared intermittently, only under that timing. Notes now wait for a boundary, in the transaction that writes them, with a store test. Also found: `scout`'s 20 s deadline expired while kubelet's crash backoff held the pod down (the deadline counts downtime, as agent-pi's does), and the suite left too many sessions on its volume for repeated runs; both were the test's, and the smoke agents' limits changed.
+
+Not tested: `maxLifetimeMs` and `idleTtlMs` expiry end to end, an urgent `task_note`, a report past `maxUnattendedRuns` end to end (the store test covers the decision), and background tasks with a real model on the cluster: Ti declares no sub-agents.
+
+## 2026-11-05: step 10c, flows
+
+agent-pi's `flow.test.ts` in Rust (`tests/flow.rs`, using its `customer-visit-preparation` fixture and the assistant's `weather` flow), and the end-to-end part against the real process in `scripts/smoke.mjs`, on `ti-demo`'s `lookup` and `guided` skills:
+
+| Check | Observed result |
+| --- | --- |
+| Validation and synthesis | Tools collected; cycles, unknown targets and duplicates refused; a `guided` flow drawn from headings and from tools alone |
+| Parallel lookups | 1 company matched: `llmCallsSaved` 3, `parallelToolsRun` 6, `ask_disambiguate` skipped, evidence holds `company_detail` and the quote |
+| Disambiguation | 2 companies: `needs_input`, the numbered list, one tool called |
+| No match | Joins at `product_cases`; three tools called |
+| `load_skill` with `query` | `flow.updated` per step, last one `completed`; one tool call, two model calls; `<flow_evidence>` in the tool result; `flow` in `session.get` and the snapshot |
+| `ask_user` | `<flow_needs_input>` with the question; nothing called |
+| Guided | Trace `running` on load, `completed` when the model answered |
+| `skills.checkFlow` | An edit returned and not saved; a tool outside the skill's list 400; a custom flow 400 until its `tools` are given; `skills.list` unchanged |
+| Crash, local and Kubernetes | SIGKILL with a flow's first tool finished and its unsafe second in flight: first not repeated, second not repeated, evidence says `interrupted`, the run completed |
+| `cargo test --workspace` | 91 passed |
+| `node agent-ti/scripts/test-local.mjs` | Passed |
+| `./scripts/test-k8s.sh` | Passed. The first run stopped at "container did not restart": a fifth kill of one pod waits 1m20s on kubelet's backoff, past the script's 60 s; the wait is now 180 s |
+| Contract | 20 of 20 |
+| Local cluster, namespace `t10` | Deployed (`t10/agent-ti:flows`), migration applied; Ti declares no skills, so no flow has run there |
+
+Found while porting: `apply_tenant_skills` checked only `call.tool`, so a tenant's `parallel` calls and `tools` weren't held to the skill's list, which started to matter once flows run. A tool's early errors in `invoke` (no grant, wrong tenant) returned without recording their step; they now record it. `serde_json` sorted object keys, which would have changed which `extract.keywords` entry wins, so the workspace now sets `preserve_order`.
+
+Not tested: a real model through a flow, tenant-published flows on the cluster (the checks run in `tests/flow.rs` and `tests/tenant_skills.rs`), and flows calling a tenant connector.
+
+## 2026-11-05: step 11, replicas
+
+`scripts/replicas.mjs`: three replicas behind a real `ai-gateway-agent`, its token check pointed at the fixture's JWKS. Locally (`scripts/test-replicas.mjs`, the gateway built from the sibling repo, SIGKILL for the loss) and on the cluster (`scripts/test-replicas-k8s.sh`, image `ai-gateway:latest`, a scale for the loss, which keeps the volume):
+
+| Check | Observed result |
+| --- | --- |
+| Placement | 30 people reached all three replicas; each person's second session stayed on the first's replica |
+| Routing | Prompts, streams and transcripts through the gateway reached the replica in the ID on each of the three |
+| Wrong replica | 421, `Agent-Instance: ti-demo.agent-ti-0`, code -32021 on `POST`, `GET` and `DELETE`; the owner still answered; a malformed ID 404 |
+| Listing | One person's sessions on three replicas came back merged, newest first, and whole across a `limit: 2` cursor |
+| `DELETE` | 204 through the gateway; then 404 |
+| Losing a replica | Its session answered 5xx; another replica's session answered a prompt; new sessions went elsewhere; the list said `partial` and held the rest |
+| Getting it back | Its session answered with its transcript intact and took another prompt; the list was whole |
+| `cargo test --workspace`, `scripts/test-local.mjs`, `./scripts/test-k8s.sh`, contract 20 of 20 | Passed |
+| Local cluster, namespace `t10` | `t10/agent-ti:replicas`, one replica, `AGENT_INSTANCE_ID` from the pod name; still `agent-ti-0`, so its sessions' IDs are unchanged |
+
+Found while doing it: every replica would have had the ID `agent-ti-0`, since the workload never set `AGENT_INSTANCE_ID`. A stream opened on the wrong replica got 404, because ownership was checked first. `DELETE` wasn't routed at all, though the plan listed it as built. A 421 had no header and the code -32421; error codes now follow agent-pi's table. The plan's `Agent-Instance` claim was also not yet true of `GET`.
+
+Not tested: routes from `t10-agent-control` with more than one Ti replica (the test uses `AGENT_URLS`), `t10-livekit-agent`'s routing by ID, and a replica added to a running pool.
+
+## 2026-11-05: step 12, operations
+
+### Load: agent-ti against agent-pi
+
+`scripts/perf-compare.mjs`: t10-perf's client and mock model, agent-pi's assistant `agent.json` unchanged on both, one process each with its own SQLite file, release build of agent-ti, Node 25 for agent-pi. Limits set high so neither's decide the result. Mock model: 300 ms to first token, 30 tokens at 20 ms, no tools. One machine (16 CPUs) running client, mocks and runtime, on a laptop SSD: compare the two, and don't read these as a server's capacity. Each user takes 3 turns; times in ms.
+
+| Users | agent-ti turns/s | TTFT p50 / p95 | Failed | Peak RSS | agent-pi turns/s | TTFT p50 / p95 | Failed | Peak RSS |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 10 | 10.2 | 335 / 357 | 0 | 26 MiB | 9.5 | 445 / 609 | 0 | 205 MiB |
+| 50 | 42.6 | 328 / 332 | 0 | 39 MiB | 41.4 | 445 / 517 | 0 | 307 MiB |
+| 100 | 69.5 | 331 / 398 | 0 | 59 MiB | 48.6 | 601 / 1559 | 0 | 401 MiB |
+| 200 | 89.3 | 390 / 1013 | 0 | 91 MiB | 46.4 | 662 / 5523 | 0 | 470 MiB |
+| 400 | 96.9 | 1648 / 2232 | 0 | 147 MiB | 40.2 | 757 / 13756 | 68 of 1200 | 553 MiB |
+| 800 | 81.0 | 5841 / 6923 | 0 | 267 MiB | 31.9 | 1454 / 13249 | 1019 of 2400 | 587 MiB |
+| 1600 | 67.8 | 14928 / 19437 | 0 | 459 MiB | 26.3 | 1621 / 15604 | 3347 of 4800 | 672 MiB |
+
+Idle RSS: agent-ti 16.7 MiB, agent-pi 139.9 MiB. agent-pi's p50 at 400 and above counts only the turns that succeeded, so it flatters it.
+
+Step 2a's reading was idle memory and one turn each; this is the scenario it meant to run, and it holds: lower latency and about a seventh of the memory at the sizes that matter, with twice the throughput at its peak. The gap at low concurrency is the runtime's own: 30 ms over the model's 300 ms, against about 145 ms.
+
+**Where agent-ti's limit is.** From `/metrics`, a model call's own wait for its first token stayed at 321 ms, and a run from claim to end at 920–970 ms, at every load up to 800 users. So what a client sees past that is waiting to be claimed. Throughput levels off at about 100 turns a second with about 2.4 CPUs in use. That fits every commit going through the one writer with `synchronous=FULL`, though it wasn't isolated further. It's per store, so it's per agent and per replica.
+
+### Limits
+
+| Limit | Was | Now | Why |
+| --- | --- | --- | --- |
+| `maxConcurrentRuns` | 200 | 200 | Measured: at 200, TTFT p95 682 ms and 98 turns/s. Past it, runs only wait longer. Capping at 200 kept 400 and 800 users at or above uncapped throughput |
+| `maxConcurrentRunsPerTenant` | 16 | 100 | At 16, one tenant got 16.7 turns/s. At 100: 69.5 turns/s with TTFT p95 under 400 ms, leaving half the process for others |
+| `maxQueuedPerTenant` | 128 | 1024 | At 128, 212 of 600 turns failed with 200 users of one tenant. 1,024 is about 10 s of work at the measured rate |
+| `maxStreams` | 1000 | 2000 | At 1000, 227 of 2400 turns failed with 800 users, each holding a listening stream and a turn's. 1,600 users took 459 MiB, within the workload's 1 GiB |
+
+On those defaults, with no overrides, in one tenant:
+
+| Users | Turns/s | TTFT p50 / p95 | Failed | Peak RSS |
+| --- | --- | --- | --- | --- |
+| 100 | 69.5 | 332 / 380 | 0 | 51 MiB |
+| 200 | 81.0 | 677 / 1415 | 0 | 81 MiB |
+| 400 | 77.5 | 2335 / 3880 | 0 | 139 MiB |
+| 800 | 65.9 | 6915 / 8747 | 0 | 258 MiB |
+
+Not measured, so still starting values: `maxSessionsPerTenant`, `maxParallelTools`, and anything with tools or a real model. A voice turn wanting a first token within a second has room for about 200 active runs per replica at these numbers.
+
+### The rest
+
+| Check | Observed result |
+| --- | --- |
+| Metrics | Smoke: runs by status, run and first-token latency, tool latency per server, tokens, active runs, store size, all at `GET /metrics` |
+| Read pool | 20 parallel creates each read back on another connection at once; contract 20 of 20 three times |
+| Retention (`tests/operations.rs`) | A closed session goes whole only past its cutoff; an idle one loses events and keeps its transcript; a session with queued work keeps everything; a stream with a cursor before the gap can tell |
+| Backup and restore (`tests/operations.rs`) | With a command cut off mid-run: the copy opened, `recover` found it, it ran and finished; what came after the backup wasn't in the copy; the live store stayed writable |
+| Backup on a real process | Host file with `backup` and `retention`: a copy was written at startup while serving, and that copy served as the store of a new process |
+| Usage | Smoke: a turn's tokens in `usage.models`; a foreground child's in `usage.tools.subagents`; a task's in `tasks[].usage` and `taskUsage` |
+| `maxUnattendedTokens` (`tests/operations.rs`) | Past the budget a report became a note; after a user spoke, the same spend was behind them and a report woke the parent |
+| Hook timeouts | `within` unit-tested |
+| `cargo test --workspace` | 98 passed |
+| `scripts/test-local.mjs`, `./scripts/test-k8s.sh`, `scripts/test-replicas.mjs`, `./scripts/test-replicas-k8s.sh` | Passed |
+| Contract | agent-ti and agent-pi, 20 of 20 |
+| Local cluster, namespace `t10` | `t10/agent-ti:ops`, same instance ID, `/metrics` answers. Its host ConfigMap wasn't re-applied, so it keeps 16 runs per tenant and 1,000 streams until the overlay is |
+
+Found while doing it: `before_tool_call` errors were swallowed, so a failing security hook let the call through, against [plugins.md](plugins.md); it now refuses. The contract suite registered `after(rmSync(data))` inside `before`, and `node:test` runs that when the hook ends, so it deleted the harness's storage during the tests. One open connection survives that and a pool can't, so the suite now removes it at the end (agent-pi passes either way). `scripts/test-replicas-k8s.sh`'s first version left port-forwards running.
+
+Not tested: `before_tool_call` refusing end to end (no plugin in the smoke fails), the retention job on its hourly timer (`prune` itself is tested), retention or backups on the cluster, and `/metrics` being scraped: nothing on the platform collects Prometheus metrics yet, as `ARCHITECTURE.md` notes.
+
+## 2026-11-06: flow fixes, in agent-ti and agent-pi
+
+Two bugs in the engine agent-ti copied, fixed in both so they stay the same:
+
+| Bug | Before | After |
+| --- | --- | --- |
+| A join after a switch depended on edge order | With the edge to the join listed before the edge to the skipped branch, the join stayed `pending` and its tool never ran; the flow still reported `completed` | The skip reports what it leaves ready, so the join runs in any order, and through a chain of skipped steps |
+| A result with `storeAs` was in the evidence twice | Under its step's name and its stored name, doubling what the model read | Once, under the stored name; later steps can still read it by either |
+
+New tests in `tests/flow.rs` and agent-pi's `flow.test.ts` were run with each fix disabled, to see them fail, and pass with the fixes in. After the fixes: agent-pi's whole suite 282 of 282, and the contract 20 of 20 on both. agent-pi isn't redeployed. agent-ti is on namespace `t10` as `t10/agent-ti:flowfix`.
+
+## 2026-11-06: usage of runs that end badly
+
+Spend is now added in the transaction that records each model call, not when the run finishes. A store test fails a run after a recorded call and finds its tokens kept, and a reused step adds nothing. The smoke cancels a run during its tool call and finds the first model call's 15 tokens in `usage`. A model call cut off mid-stream still counts nothing, since providers report usage at the end of a reply. Not tested: a crash between calls end to end.

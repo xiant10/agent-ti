@@ -27,10 +27,13 @@ All keyed by `(tenant_id, agent_id, session_id, …)`, with composite foreign ke
 | `commands` | Each accepted input: request key and fingerprint, turn ID, input, status (`queued`, `running`, `completed`, `failed`, `cancelled`, `parked`), cancel flag, attempt, admission order |
 | `steps` | Each model call, tool call or hook decision of a command: operation ID, kind, input digest, whether it is an unsafe effect, recorded result |
 | `messages` | The transcript: ordered model-visible messages per command |
+| `tasks` | agent-pi's `app.tasks`: a session's background tasks, their status, child, pending inputs, deadlines' clocks and last report |
+| `task_messages` | Inputs to a task's child and reports to its parent, each with the request key that dedupes its submission, and how far the supervisor has moved it |
+| `compactions` | pi-durable's compaction entries: a summary of a session's messages before `head`, the first message kept. Model requests start from the newest; messages stay |
 | `events` | Client events in order, the source for SSE replay and snapshots |
 | `cancel_keys` | Idempotent cancellation |
 
-The matching features add: the session inbox (steers, follow-ups and plugin history writes waiting for a boundary), active tools and loaded skills per session, plugin state per session and plugin, compaction summaries, and child runs for sub-agents and background tasks.
+The matching features add: the session inbox (steers, follow-ups and plugin history writes waiting for a boundary), active tools and loaded skills per session, plugin state per session and plugin, and child runs for sub-agents and background tasks.
 
 Each file also has `store_meta`, which records its agent and, when the host file sets none, the replica's instance ID. `commands` counts restarts in a row without a new step (`stalls`), which is how a crash loop is told apart from progress.
 
@@ -77,8 +80,26 @@ Deltas are kept in a per-session memory ring (1,024 deltas or 1 MiB); a session 
 
 ## Retention and backups
 
-A retention job for closed sessions and old events, and backups with SQLite's online backup API (copying the file alone while WAL is active is not a backup). Restore is tested with pending commands.
+Off unless the host file asks ([configuration](configuration.md#retention-and-backups)). Retention works in batches of 100 sessions, so the writer isn't held for long: a session idle past `eventsDays` loses its events and steps, and one closed and idle past `closedSessionsDays` loses everything. Sessions with queued or running work are skipped. `next_event` stays, so a stream can tell its events are gone and start with a snapshot. Backups are `VACUUM INTO` on a reader connection, which gives a consistent copy while writers carry on (copying the file alone while WAL is active is not a backup). Restoring one with pending commands is tested: they run again, as after a crash.
 
 ## Later
 
 A shared PostgreSQL store with session leases, so any replica can run any session, stays an option (see [design.md](design.md#later-not-now)). It would need the same operations with fencing on every commit, a gateway that stops routing by replica, and the same tests on both stores.
+
+## Compaction
+
+As pi-durable: before a run, its context is estimated at 3.5 characters a token. Above `contextWindow - reserveTokens` the run waits for a summary; above that less `backgroundTokens` (32,768) a summary is made in the background for later runs. The cut keeps about `keepRecentTokens` of recent messages and never separates a tool call from its result; the summarizer gets the earlier summary and the messages before the cut as a transcript, with pi-durable's prompt. A summary is placed only if it cuts further than the newest one, so when several are made at once the furthest stays. A provider's context-overflow error compacts and runs the command once more.
+
+Which summary a run starts from is its `context` step, so a replay after a restart rebuilds the same history even if a newer summary was placed meanwhile; the retry after an overflow is a second generation whose step IDs start with `g1:`, so its requests don't meet the first generation's recorded ones.
+
+## Background tasks
+
+Each step the supervisor takes is one transaction, and every message has a request key that names its cause, so a restart repeats nothing: an input settled and its report queued commit together, and a wake is an ordinary command deduped by its key. A report that an interrupt withdraws before it was placed comes back as a note under `<key>:note`. A note is placed only when the session has no work running or queued, checked in the same transaction as the write, so it can't land between a run's input and the request that run makes. Deadlines are stored, so time a process is down counts toward them, as in agent-pi.
+
+## Flows
+
+`sessions.flow` holds the trace of the skill flow a session last ran; each change also commits a `flow.updated` event carrying the whole trace. A flow runs inside `load_skill`, which a restart runs again, so each of its tool calls is its own step, `<load_skill's step>:flow:<node>` (or `:<node>:<item>` for a parallel call), unsafe like any MCP call. After a crash a finished call's result is reused and a cut-off call comes back as `interrupted`, so what the flow reads next is what it read before. If the skill changed in between and the arguments differ, the step's digest no longer matches and that call fails as a tool error.
+
+## Connections
+
+One writer connection and four read-only ones per store. Under WAL, readers don't wait for the writer or each other, and they see every committed transaction. Commits still go one at a time, which is what bounds a store's throughput (see the [measurements](validation.md#2026-11-05-step-12-operations)).

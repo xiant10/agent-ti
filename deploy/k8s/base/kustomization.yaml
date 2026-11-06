@@ -7,4 +7,4 @@ configMapGenerator:
   - name: agent-ti-host
     files: [config/agent-ti.json]
   - name: agent-ti-agent-ti
-    files: [agents/ti/agent.json, agents/ti/base.md]
+    files: [agents/ti/agent.json, agents/ti/base.md, agents/ti/voice.md]

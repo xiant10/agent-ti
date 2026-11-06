@@ -40,17 +40,93 @@ pub struct Host {
     pub auth: Auth,
     pub accepting: AtomicBool,
     pub scheduler: Scheduler,
+    pub metrics: crate::metrics::Metrics,
     streams: Arc<Semaphore>,
     requests: Arc<Semaphore>,
 }
+/// `GET /metrics`, unauthenticated as the probes are. The gateway forwards only agent paths, and
+/// the workload's NetworkPolicy decides who reaches this port.
+async fn metrics(State(host): State<Arc<Host>>) -> Response {
+    let running = host.scheduler.active() as f64;
+    let mut gauges = vec![
+        ("agent_ti_runs_active", String::new(), running),
+        (
+            "agent_ti_streams_open",
+            String::new(),
+            (host.config.limits.max_streams - host.streams.available_permits()) as f64,
+        ),
+    ];
+    for agent in host.agents.values() {
+        let path = host
+            .config
+            .storage_dir
+            .join(format!("{}.sqlite", agent.name));
+        let bytes = std::fs::metadata(path).map_or(0, |m| m.len());
+        gauges.push((
+            "agent_ti_store_bytes",
+            crate::metrics::gauge_labels(&[("agent", &agent.name)]),
+            bytes as f64,
+        ));
+    }
+    (
+        [("content-type", "text/plain; version=0.0.4")],
+        host.metrics.render(&gauges),
+    )
+        .into_response()
+}
+/// agent-pi's JSON-RPC error code for a status (`errors.ts`).
+fn rpc_code(status: StatusCode) -> i32 {
+    match status.as_u16() {
+        400 => -32602,
+        401 => -32001,
+        403 => -32003,
+        404 => -32004,
+        409 => -32009,
+        421 => -32021,
+        422 => -32022,
+        429 => -32029,
+        _ => -32603,
+    }
+}
 fn fail(status: StatusCode, message: &str) -> Response {
-    let mut response = (status, Json(json!({"jsonrpc":"2.0","id":null,"error":{"code":-(32000+status.as_u16() as i32),"message":message}}))).into_response();
+    let mut response = (
+        status,
+        Json(
+            json!({"jsonrpc":"2.0","id":null,"error":{"code":rpc_code(status),"message":message}}),
+        ),
+    )
+        .into_response();
     if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE {
         response
             .headers_mut()
             .insert("retry-after", HeaderValue::from_static("1"));
     }
     response
+}
+/// Refuses a session ID this replica doesn't own, before anything is read for it. A public ID is
+/// `<agent>.<replica>.<n>`: another replica's answers 421 naming that replica, and anything else
+/// reads as not found.
+fn misdirected(agent: &Agent, id: &str) -> Option<Response> {
+    let name = |c: char| c.is_ascii_alphanumeric() || "_.-".contains(c);
+    let Some((instance, _)) = id.rsplit_once('.').filter(|(instance, n)| {
+        !instance.is_empty()
+            && instance.chars().all(name)
+            && !n.is_empty()
+            && n.chars().all(|c| c.is_ascii_alphanumeric())
+    }) else {
+        return Some(storage(StoreError::NotFound));
+    };
+    if instance == format!("{}.{}", agent.name, agent.instance_id) {
+        return None;
+    }
+    let mut response = fail(
+        StatusCode::MISDIRECTED_REQUEST,
+        "session belongs to another instance",
+    );
+    if let Ok(value) = HeaderValue::from_str(instance) {
+        response.headers_mut().insert("agent-instance", value);
+    }
+    Some(response)
 }
 fn storage(e: StoreError) -> Response {
     let (status, message) = match e {
@@ -74,10 +150,35 @@ fn ok(id: Value, result: Value, session: Option<&str>) -> Response {
 fn header<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
     h.get(name).and_then(|v| v.to_str().ok())
 }
+const NOTE_OPEN: &str = "<turn-note>";
+const NOTE_CLOSE: &str = "</turn-note>\n\n";
+/// Puts a turn's note ahead of what the person said, as agent-pi does, so the model reads it and
+/// the transcript can leave it out.
+fn with_note(input: &str, note: &str) -> String {
+    format!("{NOTE_OPEN}{note}{NOTE_CLOSE}{input}")
+}
+fn without_note(text: &str) -> &str {
+    text.strip_prefix(NOTE_OPEN)
+        .and_then(|rest| rest.split_once(NOTE_CLOSE))
+        .map_or(text, |(_, input)| input)
+}
+/// What every session supports, as in agent-pi's `capabilitiesOf`.
+const CAPABILITIES: [&str; 6] = [
+    "durable_runs",
+    "steer",
+    "interrupt",
+    "voice",
+    "retry",
+    "background_tasks",
+];
+/// A spend in agent-pi's `Usage` shape. This store keeps input and output tokens only.
+fn usage_value((input, output): (u64, u64)) -> Value {
+    json!({"input":input,"output":output,"cacheRead":0,"cacheWrite":0,"totalTokens":input+output})
+}
 fn session_value(s: Session) -> Value {
     let parked = s.parked;
     let mut v = serde_json::to_value(s).unwrap();
-    v["capabilities"] = json!(["durable_runs", "steer", "interrupt", "retry"]);
+    v["capabilities"] = json!(CAPABILITIES);
     v["tasks"] = json!([]);
     v["usage"] = json!({});
     v["parked"] = json!(parked);
@@ -198,7 +299,8 @@ async fn principal(
                 scopes: p.scopes.clone(),
                 claims: p.claims.clone(),
             };
-            let updated = plugin.authenticate(info).await.map_err(|e| {
+            let limit = Duration::from_millis(host.config.limits.hook_timeout_ms);
+            let updated = crate::plugins::within(limit, "authenticate", plugin.authenticate(info)).await.map_err(|e| {
                 tracing::warn!(agent = %agent.name, plugin = plugin.name(), error = %e, "authenticate hook rejected");
                 ApiError(StatusCode::FORBIDDEN, "authentication hook rejected")
             })?;
@@ -328,10 +430,26 @@ async fn prompt(
             "input is longer than limits.maxInputChars",
         ));
     }
+    let mut note = match &params["note"] {
+        Value::Null => None,
+        Value::String(n) if n.chars().count() <= agent.config.limits.max_input_chars => {
+            Some(n.clone())
+        }
+        Value::String(_) => {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "note is longer than limits.maxInputChars",
+            ));
+        }
+        _ => return Err(fail(StatusCode::BAD_REQUEST, "note must be a string")),
+    };
     let Some(key) = params["requestId"].as_str() else {
         return Err(fail(StatusCode::BAD_REQUEST, "requestId required"));
     };
-    let fingerprint = digest(&json!({"kind":"prompt","input":input}));
+    let fingerprint = match &note {
+        None => digest(&json!({"kind":"prompt","input":input})),
+        Some(note) => digest(&json!({"kind":"prompt","input":input,"note":note})),
+    };
     if let Some(prior) = agent
         .store
         .prior(&s, session_id, key)
@@ -353,18 +471,29 @@ async fn prompt(
     for plugin in &agent.plugins {
         let turn = Turn {
             text: &text,
+            note: note.as_deref(),
             agent: &agent.name,
             session_id,
             tenant_id: &s.tenant_id,
             user_id: &s.user_id,
         };
-        let decision = plugin.before_prompt(&turn).await.map_err(|e| {
+        let limit = Duration::from_millis(host.config.limits.hook_timeout_ms);
+        let decision = crate::plugins::within(limit, "before_prompt", plugin.before_prompt(&turn)).await.map_err(|e| {
             tracing::error!(agent = %agent.name, plugin = plugin.name(), error = %e, "before_prompt failed");
             fail(StatusCode::INTERNAL_SERVER_ERROR, "a plugin failed")
         })?;
         match decision {
             None => {}
             Some(PromptDecision::Input(rewrite)) => text = rewrite,
+            Some(PromptDecision::Rewrite {
+                text: rewrite,
+                note: rewritten,
+            }) => {
+                text = rewrite;
+                if rewritten.is_some() {
+                    note = rewritten;
+                }
+            }
             Some(PromptDecision::InputAndTools {
                 text: rewrite,
                 activate_tools,
@@ -404,8 +533,16 @@ async fn prompt(
     };
     agent.turn_pins.pin(session_id, turn_skills.clone()).await;
 
+    // Someone is here: idle tasks' reply clocks start, and tasks may wake the session again.
+    if session_state.session.parent.is_none() && agent.has_background_tasks() {
+        let _ = agent.store.tasks_heard(&s, session_id).await;
+    }
     let profile_name = session_state.session.profile;
     if let Some(prof) = agent.config.profiles.get(&profile_name) {
+        // A plugin's reply is spoken too, so the session speaks before it is committed.
+        if prof.speech {
+            agent.hub.speak(session_id, session_state.high_water);
+        }
         let pinned = agent.pinned_tools(&s.tenant_id, prof).await;
         let policy = agent_ti_store::ActivationPolicy {
             pinned,
@@ -452,7 +589,10 @@ async fn prompt(
         session_id: session_id.into(),
         request_key: key.into(),
         fingerprint,
-        input: text,
+        input: match &note {
+            Some(note) => with_note(&text, note),
+            None => text,
+        },
         turn_id,
         traceparent,
         reply,
@@ -588,6 +728,53 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
                 None,
             );
         }
+        // Saves nothing: a tenant admin publishes at t10-agent-control, and this says first what the
+        // runtime will refuse. A built-in skill's name checks an override; any other a custom skill.
+        "skills.checkFlow" => {
+            let Some(name) = r
+                .params
+                .get("skill")
+                .and_then(Value::as_str)
+                .filter(|n| !n.is_empty())
+            else {
+                return fail(StatusCode::BAD_REQUEST, "skill must be a non-empty string");
+            };
+            let Some(flow) = r.params.get("flow").filter(|f| f.is_object()) else {
+                return fail(StatusCode::BAD_REQUEST, "flow must be an object");
+            };
+            let tools = r
+                .params
+                .get("tools")
+                .and_then(Value::as_array)
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .filter_map(|t| t.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                });
+            let checked = match agent.config.skills.iter().find(|skill| skill.name == name) {
+                Some(builtin) => agent_ti_config::override_flow(builtin, flow),
+                None => {
+                    let content = agent_ti_config::TenantSkillContent {
+                        description: Some(name.to_string()),
+                        tools,
+                        flow: Some(flow.clone()),
+                        ..Default::default()
+                    };
+                    agent_ti_config::custom_skill(name, &content, None)
+                        .map(|skill| skill.flow.unwrap_or_default())
+                }
+            };
+            return match checked.and_then(|flow| agent_ti_config::flow::validate_skill_flow(&flow))
+            {
+                Ok((tools, flow)) => ok(
+                    r.id,
+                    json!({"skill": name, "flow": flow, "tools": tools}),
+                    None,
+                ),
+                Err(e) => fail(StatusCode::BAD_REQUEST, &e),
+            };
+        }
         "skills.tools" => {
             let tools = agent.catalog_tools(&s.tenant_id).await;
             let result: Vec<Value> = tools
@@ -613,11 +800,18 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
         if session_id.is_empty() || session_id.len() > 256 {
             return fail(StatusCode::BAD_REQUEST, "session ID required");
         }
-        let pieces: Vec<_> = session_id.split('.').collect();
-        if pieces.len() == 3 && (pieces[0] != agent.name || pieces[1] != agent.instance_id) {
-            return fail(StatusCode::MISDIRECTED_REQUEST, "wrong SQLite owner");
+        if let Some(response) = misdirected(&agent, &session_id) {
+            return response;
         }
         match agent.store.state(&s, &session_id).await {
+            // A child session can be read, never driven: its parent's tool call owns it.
+            Ok(state)
+                if state.session.parent.is_some()
+                    && !["session.get", "session.messages", "session.tool"]
+                        .contains(&r.method.as_str()) =>
+            {
+                return storage(StoreError::NotFound);
+            }
             Ok(state) if state.session.status == "open" => {}
             Ok(_) => return storage(StoreError::NotFound),
             Err(e) => return storage(e),
@@ -643,6 +837,7 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
                 config_version: agent.version.clone(),
                 origin: p.origin(),
                 metadata: r.params.get("metadata").cloned().unwrap_or(json!({})),
+                child: None,
             };
             return match agent.store.create(request).await {
                 Ok((session, duplicate)) => {
@@ -689,7 +884,10 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
                                 state: state_adapter,
                                 history: history_adapter,
                             };
-                            let _ = plugin.session_created(&ctx).await;
+                            let limit = Duration::from_millis(host.config.limits.hook_timeout_ms);
+                            if let Err(e) = crate::plugins::within(limit, "session_created", plugin.session_created(&ctx)).await {
+                                tracing::warn!(agent = %agent.name, plugin = plugin.name(), error = %e, "session_created failed");
+                            }
                         }
                     }
                     ok(r.id, session_value(session), Some(&id))
@@ -701,7 +899,56 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
             let next = sessions.last().map(|s| s.session_id.clone());
             json!({"sessions":sessions.into_iter().map(session_value).collect::<Vec<_>>(),"nextCursor":next})
         }),
-        "session.get" => agent.store.state(&s, &session_id).await.map(|state| session_value(state.session)),
+        "session.get" => match agent.store.state(&s, &session_id).await {
+            Ok(state) => match agent.store.tasks(&s, &session_id).await {
+                Ok(tasks) => {
+                    let flow = agent.store.flow(&s, &session_id).await.unwrap_or_default();
+                    let spent = agent.store.usage(&s, &session_id).await.unwrap_or_default();
+                    agent.store.children(&s, &session_id).await.map(|children| {
+                        let profile = state.session.profile.clone();
+                        let mut value = session_value(state.session);
+                        value["subagents"] = json!(children);
+                        value["tasks"] = json!(tasks);
+                        for task in value["tasks"].as_array_mut().into_iter().flatten() {
+                            let id = task["taskId"].as_str().unwrap_or_default();
+                            if let Some((_, used)) = spent.tasks.iter().find(|(t, _)| t == id) {
+                                task["usage"] = usage_value(*used);
+                            }
+                        }
+                        let task_total = spent.tasks.iter().fold((0, 0), |sum, (_, used)| {
+                            (sum.0 + used.0, sum.1 + used.1)
+                        });
+                        value["taskUsage"] = usage_value(task_total);
+                        let model = agent
+                            .config
+                            .profiles
+                            .get(&profile)
+                            .map_or(String::new(), |p| p.model.clone());
+                        value["usage"] = json!({
+                            "models": {model: usage_value(spent.own)},
+                            "tools": {"subagents": usage_value(spent.foreground)},
+                        });
+                        if let Some(flow) = flow {
+                            value["flow"] = flow;
+                        }
+                        value
+                    })
+                }
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        },
+        "session.tool" => {
+            let call_id = match r.params.get("callId") {
+                Some(Value::String(s)) if !s.is_empty() && s.len() <= 1000 => s.as_str(),
+                _ => return fail(StatusCode::BAD_REQUEST, "callId must be a non-empty string"),
+            };
+            match agent.store.tool_payload(&s, &session_id, call_id).await {
+                Ok(Some(payload)) => Ok(payload),
+                Ok(None) => return storage(StoreError::NotFound),
+                Err(e) => return storage(e),
+            }
+        }
         "session.messages" => {
             let before = match r.params.get("cursor") {
                 None | Some(Value::Null) => i64::MAX,
@@ -713,18 +960,37 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
             };
             agent.store.transcript(&s, &session_id, before, r.params["limit"].as_u64().unwrap_or(100).min(100) as u32).await.map(|page| {
                 let cursor = page.entries.first().map(|e| format!("{session_id}:{}", e.sequence));
+                // A tool result names its tool by the assistant call it answers; the result row itself holds only the call id.
+                let tool_names: std::collections::HashMap<String, String> = page
+                    .entries
+                    .iter()
+                    .flat_map(|e| e.message.tool_calls.iter().map(|c| (c.id.clone(), c.name.clone())))
+                    .collect();
                 let messages = page
                     .entries
                     .into_iter()
                     .map(|e| {
                         let mut value = json!({"id":e.sequence,"sequence":e.sequence,"role":e.message.role,"text":e.message.content,"toolCalls":e.message.tool_calls,"callId":e.message.tool_call_id,"stopReason":if e.status=="cancelled"{"aborted"}else{"stop"}});
+                        if e.message.role == "tool" {
+                            value["name"] = json!(e.message.tool_call_id.as_ref().and_then(|id| tool_names.get(id)).cloned().unwrap_or_default());
+                        }
                         if e.message.is_error {
                             value["isError"] = json!(true);
                         }
                         if let Some(source) = &e.message.source {
                             value["source"] = json!(source);
                         }
+                        // A task's report or note: data from a child, not something the user said.
+                        if e.message.role == "user"
+                            && let Some(line) = crate::tasks::transcript_line(&e.message.content)
+                        {
+                            let mut line = line;
+                            line["id"] = json!(e.sequence);
+                            line["sequence"] = json!(e.sequence);
+                            return line;
+                        }
                         if e.message.role == "user" {
+                            value["text"] = json!(without_note(&e.message.content));
                             value["turnId"] = json!(e.turn_id);
                             value["requestId"] = json!(e.request_id);
                         }
@@ -742,6 +1008,8 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
         "session.close" => {
             let res = agent.store.update(&s, &session_id, None, None, true).await.map(|_| json!({"closed":true}));
             if res.is_ok() {
+                // A plain close would leave background children running.
+                crate::tasks::end_all(&host, &agent, &s, &session_id).await;
                 if let Some(ref broker) = agent.grants {
                     broker.close(&session_id).await;
                 }
@@ -767,7 +1035,10 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
                         state: state_adapter,
                         history: history_adapter,
                     };
-                    let _ = plugin.session_closed(&ctx).await;
+                    let limit = Duration::from_millis(host.config.limits.hook_timeout_ms);
+                    if let Err(e) = crate::plugins::within(limit, "session_closed", plugin.session_closed(&ctx)).await {
+                        tracing::warn!(agent = %agent.name, plugin = plugin.name(), error = %e, "session_closed failed");
+                    }
                 }
             }
             res
@@ -867,6 +1138,10 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
         }
         "session.cancel" => {
             let key = r.params["requestId"].as_str().map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            // `tasks: true` ends background tasks too; a plain cancel leaves them, as agent-pi.
+            if r.params["tasks"] == true {
+                crate::tasks::end_all(&host, &agent, &s, &session_id).await;
+            }
             agent.store.cancel(&s, &session_id, &key).await.map(|running| {
                 host.scheduler.cancel(&running);
                 host.scheduler.wake();
@@ -933,6 +1208,29 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
         Err(e) => storage(e),
     }
 }
+/// `DELETE`: `session.close`, with no body and a 204.
+async fn close(host: Arc<Host>, name: Option<String>, headers: HeaderMap) -> Response {
+    if header(&headers, "agent-session-id").is_none_or(str::is_empty) {
+        return fail(StatusCode::BAD_REQUEST, "missing agent-session-id header");
+    }
+    let body = json!({"jsonrpc":"2.0","id":null,"method":"session.close","params":{}});
+    let response = rpc(host, name, headers, Bytes::from(body.to_string())).await;
+    if response.status().is_success() {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        response
+    }
+}
+async fn close_default(State(host): State<Arc<Host>>, headers: HeaderMap) -> Response {
+    close(host, None, headers).await
+}
+async fn close_named(
+    State(host): State<Arc<Host>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    close(host, Some(name), headers).await
+}
 async fn events_default(State(host): State<Arc<Host>>, headers: HeaderMap) -> Response {
     events(host, None, headers).await
 }
@@ -972,19 +1270,32 @@ async fn open_event_stream(
         user_id: p.user_id.clone(),
     };
     // Authorize ownership before examining any cursor.
+    if let Some(response) = misdirected(&agent, &id) {
+        return response;
+    }
     let state = match agent.store.state(&s, &id).await {
         Ok(v) if v.session.status == "open" => v,
         Ok(_) => return storage(StoreError::NotFound),
         Err(e) => return storage(e),
     };
-    if !id.starts_with(&format!("{}.{}.", agent.name, agent.instance_id)) {
-        return fail(StatusCode::MISDIRECTED_REQUEST, "wrong SQLite owner");
-    }
     let permit = match host.streams.clone().try_acquire_owned() {
         Ok(v) => v,
         Err(_) => return fail(StatusCode::TOO_MANY_REQUESTS, "stream capacity exceeded"),
     };
     let cursor = header(headers, "last-event-id").and_then(|v| EventId::parse(&id, v));
+    // Retention removed what the cursor would resume from: start with a snapshot instead.
+    let cursor = match cursor {
+        Some(c)
+            if agent
+                .store
+                .events_gone(&s, &id, c.seq)
+                .await
+                .unwrap_or(false) =>
+        {
+            None
+        }
+        other => other,
+    };
     let sub = agent.hub.subscribe(&id, state.high_water, cursor);
     let frame =
         |event_id: String, mut payload: Value| {
@@ -1040,9 +1351,13 @@ async fn open_event_stream(
             // A fresh stream, an unknown cursor, or one whose deltas are gone: start from a snapshot.
             _ => {
                 let busy = agent.store.state(&s, &id).await.map(|st| st.busy).unwrap_or(state.busy);
-                let mut payload = json!({"type":"snapshot","session":session_value(state.session),"busy":busy,"highWater":high_water,"partialText":partial.as_ref().map_or("", |p| p.text.as_str()),"inbox":[],"tasks":[]});
+                let tasks = agent.store.tasks(&s, &id).await.unwrap_or_default();
+                let mut payload = json!({"type":"snapshot","session":session_value(state.session),"busy":busy,"highWater":high_water,"partialText":partial.as_ref().map_or("", |p| p.text.as_str()),"inbox":[],"tasks":tasks});
                 if let Some(partial) = &partial {
                     payload["partial"] = partial.value();
+                }
+                if let Ok(Some(flow)) = agent.store.flow(&s, &id).await {
+                    payload["flow"] = flow;
                 }
                 yield frame(position.render(&id), payload);
             }
@@ -1102,7 +1417,7 @@ fn manifest(host: Arc<Host>, name: Option<String>, headers: HeaderMap) -> Respon
     let profiles: Vec<&String> = agent.config.profiles.keys().collect();
     Json(json!({
         "contract":0,"harness":"ti","harness_version":env!("CARGO_PKG_VERSION"),"pool":agent.name,"agent":agent.name,
-        "bundle":agent.version,"profiles":profiles,"capabilities":["durable_runs", "steer", "interrupt", "retry"],"builtin_tools":[],"methods":[]
+        "bundle":agent.version,"profiles":profiles,"capabilities":CAPABILITIES,"builtin_tools":[],"methods":[]
     }))
     .into_response()
 }
@@ -1122,10 +1437,17 @@ pub fn router(host: Arc<Host>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { StatusCode::OK }))
         .route("/readyz", get(ready))
+        .route("/metrics", get(metrics))
         .route("/v1/runtime", get(manifest_default))
         .route("/agents/{name}/v1/runtime", get(manifest_named))
-        .route("/agent", post(rpc_default).get(events_default))
-        .route("/agents/{name}/agent", post(rpc_named).get(events_named))
+        .route(
+            "/agent",
+            post(rpc_default).get(events_default).delete(close_default),
+        )
+        .route(
+            "/agents/{name}/agent",
+            post(rpc_named).get(events_named).delete(close_named),
+        )
         .layer(DefaultBodyLimit::max(limit))
         .with_state(host)
 }
@@ -1171,6 +1493,7 @@ pub async fn start(config: HostConfig) -> Result<(), Box<dyn Error>> {
         client,
         accepting: AtomicBool::new(true),
         scheduler: Scheduler::default(),
+        metrics: Default::default(),
     });
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     for agent in host.agents.values() {
@@ -1185,6 +1508,16 @@ pub async fn start(config: HostConfig) -> Result<(), Box<dyn Error>> {
         }
         agent.start_mcp_listeners(&host.client);
         agent.start_tenant_skills_watcher(shutdown_rx.clone());
+        if agent.has_background_tasks() {
+            tokio::spawn(crate::tasks::supervise(host.clone(), agent.clone()));
+        }
+        let retention = &host.config.retention;
+        if retention.events_days.is_some() || retention.closed_sessions_days.is_some() {
+            tokio::spawn(crate::maintenance::retain(agent.clone(), retention.clone()));
+        }
+        if let Some(backup) = &host.config.backup {
+            tokio::spawn(crate::maintenance::back_up(agent.clone(), backup.clone()));
+        }
     }
     let scheduler = tokio::spawn(worker::schedule(host.clone()));
     let sweeper = host.clone();

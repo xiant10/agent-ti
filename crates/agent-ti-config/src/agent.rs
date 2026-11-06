@@ -1,7 +1,7 @@
 //! agent-pi's `agent.json`, read unmodified (agent-pi's `config.ts` is the reference).
 use crate::{ConfigError, Raw, Reader, Result, Snapshot, host::cluster_url, substitute};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
@@ -10,6 +10,7 @@ pub struct AgentConfig {
     pub bundle: Option<String>,
     pub models: BTreeMap<String, ModelConfig>,
     pub profiles: BTreeMap<String, ProfileConfig>,
+    pub subagents: Vec<SubagentConfig>,
     pub default_profile: String,
     pub instructions: Vec<Section>,
     pub plugins: Vec<PluginRef>,
@@ -103,6 +104,34 @@ pub struct ProfileConfig {
     pub preload_min_score: f64,
     pub speech: bool,
     pub thinking_events: bool,
+    /// Offer `consult_expert`, backed by this model.
+    pub expert: Option<ExpertConfig>,
+    /// `wake`: a background task's report starts a run. `note`: it waits for the next user input.
+    pub task_reports: String,
+}
+#[derive(Clone, Debug)]
+pub struct ExpertConfig {
+    pub model: String,
+    pub thinking_level: String,
+}
+/// A sub-agent the config declares, offered as the tool `agent_<name>` (agent-pi's delegation).
+#[derive(Clone, Debug)]
+pub struct SubagentConfig {
+    pub name: String,
+    pub description: String,
+    pub model: String,
+    pub thinking_level: String,
+    pub instructions: Option<String>,
+    /// The exact starting tool set: catalog patterns, plus `load_skill` and `search_tools` by name.
+    pub tools: Vec<String>,
+    /// One run's deadline: the call's in the foreground, each run's in the background.
+    pub timeout_ms: u64,
+    /// Return at once, and report when the child's turn ends (agent-pi's `async-tasks.md`).
+    pub background: bool,
+    /// With `background`: how long an idle child waits for a reply, from the first user input after it stopped.
+    pub idle_ttl_ms: u64,
+    /// With `background`: how long the task may live.
+    pub max_lifetime_ms: u64,
 }
 #[derive(Clone, Debug)]
 pub struct Section {
@@ -154,12 +183,34 @@ pub struct AgentLimits {
     pub max_concurrent_runs_per_user: usize,
     pub max_input_chars: usize,
     pub max_tool_rounds: u32,
+    /// Children running at once for a session, `consult_expert` included.
+    pub max_subagents_per_session: usize,
+    /// Background tasks alive at once per session.
+    pub max_tasks_per_session: usize,
+    /// Background children's runs at once per user, apart from `maxConcurrentRunsPerUser`.
+    pub max_background_runs_per_user: usize,
+    /// Runs tasks may start since a user last spoke; past it, reports become notes.
+    pub max_unattended_runs: u64,
+    pub max_unattended_tokens: u64,
 }
 #[derive(Clone, Debug)]
 pub struct Durable {
     pub stream_timeout_ms: u64,
     pub cache_retention: Option<String>,
     pub restart_limit: u32,
+    pub compaction: Compaction,
+}
+/// pi-durable's compaction policy, with its defaults. `background_tokens` isn't an `agent.json`
+/// field in agent-pi either.
+#[derive(Clone, Debug)]
+pub struct Compaction {
+    pub enabled: bool,
+    /// Above `contextWindow - reserve_tokens`, the next request waits for a compaction.
+    pub reserve_tokens: u64,
+    /// Roughly how much recent context stays verbatim.
+    pub keep_recent_tokens: u64,
+    /// This far below the blocking threshold, a compaction starts in the background.
+    pub background_tokens: u64,
 }
 
 const TOP: &[&str] = &[
@@ -390,18 +441,22 @@ pub fn load_agent(
             &format!("{at}.preload"),
             &["maxTools", "minScore"],
         )?;
-        if let Some(expert) = p.get("expert") {
-            let e = r.object(expert, &format!("{at}.expert"), &["model", "thinkingLevel"])?;
-            model_name(e.get("model"), &format!("{at}.expert.model"))?;
-            r.one_of(
-                e.get("thinkingLevel"),
-                &format!("{at}.expert.thinkingLevel"),
-                THINKING,
-                Some("high"),
-            )?;
-            note(&format!("{at}.expert"), "consult_expert, step 8");
-        }
-        r.one_of(
+        let expert = match p.get("expert") {
+            Some(expert) => {
+                let e = r.object(expert, &format!("{at}.expert"), &["model", "thinkingLevel"])?;
+                Some(ExpertConfig {
+                    model: model_name(e.get("model"), &format!("{at}.expert.model"))?,
+                    thinking_level: r.one_of(
+                        e.get("thinkingLevel"),
+                        &format!("{at}.expert.thinkingLevel"),
+                        THINKING,
+                        Some("high"),
+                    )?,
+                })
+            }
+            None => None,
+        };
+        let task_reports = r.one_of(
             p.get("taskReports"),
             &format!("{at}.taskReports"),
             &["wake", "note"],
@@ -444,10 +499,9 @@ pub fn load_agent(
                 &format!("{at}.thinkingEvents"),
                 false,
             )?,
+            expert,
+            task_reports,
         };
-        if profile.speech {
-            note(&format!("{at}.speech"), "speech events, step 8");
-        }
         profiles.insert(name.clone(), profile);
     }
     if let Some(progress) = r.optional_string(top.get("progressModel"), "progressModel")? {
@@ -461,12 +515,56 @@ pub fn load_agent(
     if !profiles.contains_key(&default_profile) {
         return r.fail("defaultProfile", "must name a configured profile");
     }
-    if top
-        .get("subagents")
-        .and_then(Value::as_object)
-        .is_some_and(|s| !s.is_empty())
-    {
-        note("subagents", "step 10");
+    let mut subagents = Vec::new();
+    for (name, value) in r.map(top.get("subagents"), "subagents")? {
+        let at = format!("subagents.{name}");
+        if !agent_name(name) {
+            return r.fail(&at, "names must match ^[a-z][a-z0-9_-]*$");
+        }
+        let a = r.object(
+            value,
+            &at,
+            &[
+                "description",
+                "model",
+                "thinkingLevel",
+                "instructionsFile",
+                "tools",
+                "timeoutMs",
+                "background",
+                "idleTtlMs",
+                "maxLifetimeMs",
+            ],
+        )?;
+        let instructions = match r
+            .optional_string(a.get("instructionsFile"), &format!("{at}.instructionsFile"))?
+        {
+            Some(file) => Some(text(&file, &format!("{at}.instructionsFile"))?),
+            None => None,
+        };
+        subagents.push(SubagentConfig {
+            name: name.clone(),
+            description: r.string(a.get("description"), &format!("{at}.description"))?,
+            model: model_name(a.get("model"), &format!("{at}.model"))?,
+            thinking_level: r.one_of(
+                a.get("thinkingLevel"),
+                &format!("{at}.thinkingLevel"),
+                THINKING,
+                Some("off"),
+            )?,
+            instructions,
+            tools: r.strings(a.get("tools"), &format!("{at}.tools"))?,
+            timeout_ms: r
+                .count(a.get("timeoutMs"), &format!("{at}.timeoutMs"), 300_000)?
+                .max(1),
+            background: r.boolean(a.get("background"), &format!("{at}.background"), false)?,
+            idle_ttl_ms: r.count(a.get("idleTtlMs"), &format!("{at}.idleTtlMs"), 600_000)?,
+            max_lifetime_ms: r.count(
+                a.get("maxLifetimeMs"),
+                &format!("{at}.maxLifetimeMs"),
+                3_600_000,
+            )?,
+        });
     }
     if top.contains_key("mcpEndpoint") {
         note("mcpEndpoint", "the agent's own MCP endpoint");
@@ -541,10 +639,18 @@ pub fn load_agent(
             let mut skill = parse_skill(&skill_file, &content)?;
             let prefix = format!("{subdir}/");
             let flow_file = format!("{dir}/{subdir}/flow.json");
-            if let Ok(flow_content) = snapshot.read_text(&flow_file)
-                && let Ok(flow_val) = serde_json::from_str::<Value>(&flow_content)
+            if list
+                .iter()
+                .any(|item| *item == format!("{subdir}/flow.json"))
             {
-                skill.flow = Some(flow_val);
+                let flow_content = snapshot.read_text(&flow_file)?;
+                let flow = serde_json::from_str::<Value>(&flow_content)
+                    .map_err(|e| e.to_string())
+                    .and_then(|value| crate::flow::validate_skill_flow(&value));
+                match flow {
+                    Ok((_, flow)) => skill.flow = Some(flow),
+                    Err(e) => return r.fail("skillsDir", &format!("{flow_file}: {e}")),
+                }
             }
             for item in &list {
                 if let Some(sub_path) = item.strip_prefix(&prefix)
@@ -740,6 +846,27 @@ pub fn load_agent(
         )? as usize,
         max_input_chars: r.count(l.get("maxInputChars"), "limits.maxInputChars", 32_000)? as usize,
         max_tool_rounds: r.count(l.get("maxToolRounds"), "limits.maxToolRounds", 12)? as u32,
+        max_subagents_per_session: r.count(
+            l.get("maxSubagentsPerSession"),
+            "limits.maxSubagentsPerSession",
+            3,
+        )? as usize,
+        max_tasks_per_session: r.count(
+            l.get("maxTasksPerSession"),
+            "limits.maxTasksPerSession",
+            5,
+        )? as usize,
+        max_background_runs_per_user: r.count(
+            l.get("maxBackgroundRunsPerUser"),
+            "limits.maxBackgroundRunsPerUser",
+            3,
+        )? as usize,
+        max_unattended_runs: r.count(l.get("maxUnattendedRuns"), "limits.maxUnattendedRuns", 10)?,
+        max_unattended_tokens: r.count(
+            l.get("maxUnattendedTokens"),
+            "limits.maxUnattendedTokens",
+            1_000_000,
+        )?,
     };
     if limits.max_tool_rounds == 0 || limits.max_tool_rounds > 128 {
         return r.fail("limits.maxToolRounds", "must be between 1 and 128");
@@ -767,16 +894,24 @@ pub fn load_agent(
         "durable.compaction",
         &["enabled", "reserveTokens", "keepRecentTokens"],
     )?;
-    if r.boolean(
-        compaction.get("enabled"),
-        "durable.compaction.enabled",
-        false,
-    )? {
-        note(
-            "durable.compaction",
-            "compaction, step 9; the last eight turns are sent",
-        );
-    }
+    let compaction = Compaction {
+        enabled: r.boolean(
+            compaction.get("enabled"),
+            "durable.compaction.enabled",
+            true,
+        )?,
+        reserve_tokens: r.count(
+            compaction.get("reserveTokens"),
+            "durable.compaction.reserveTokens",
+            16_384,
+        )?,
+        keep_recent_tokens: r.count(
+            compaction.get("keepRecentTokens"),
+            "durable.compaction.keepRecentTokens",
+            20_000,
+        )?,
+        background_tokens: 32_768,
+    };
     let retry = r.optional_object(
         d.get("retry"),
         "durable.retry",
@@ -802,6 +937,7 @@ pub fn load_agent(
         restart_limit: r
             .count(d.get("restartLimit"), "durable.restartLimit", 5)?
             .max(1) as u32,
+        compaction,
     };
     let bundle = r.optional_string(top.get("bundle"), "bundle")?;
     Ok(AgentConfig {
@@ -809,6 +945,7 @@ pub fn load_agent(
         bundle,
         models,
         profiles,
+        subagents,
         default_profile,
         instructions,
         plugins,
@@ -1079,11 +1216,16 @@ pub fn parse_skill(file: &str, content: &str) -> Result<SkillConfig> {
     Ok(SkillConfig {
         name: name.to_string(),
         description: description.to_string(),
-        tools,
         keywords,
-        body,
+        body: body.clone(),
         files: BTreeMap::new(),
-        flow: None,
+        flow: Some(crate::flow::synthesize_skill_flow(
+            name,
+            description,
+            &tools,
+            &body,
+        )),
+        tools,
         source: None,
     })
 }
@@ -1117,6 +1259,9 @@ pub fn pattern_matches_glob(pattern: &str, text: &str) -> bool {
     }
     true
 }
+
+/// Longest pattern a tenant flow's extract step may run, as control also checks.
+const MAX_PATTERN: usize = 200;
 
 pub fn tool_allowed_by_skill(tool: &str, patterns: &[String]) -> bool {
     if patterns.is_empty() {
@@ -1162,40 +1307,96 @@ pub fn is_valid_reference_file_path(path: &str) -> bool {
     true
 }
 
-fn extract_flow_tools(flow: &Value) -> Vec<String> {
-    let mut tools = Vec::new();
-    if let Some(nodes) = flow.get("nodes").and_then(Value::as_array) {
-        for node in nodes {
-            if let Some(call) = node.get("call").and_then(Value::as_object)
-                && let Some(tool) = call.get("tool").and_then(Value::as_str)
+fn check_patterns(flow: &Value) -> std::result::Result<(), String> {
+    let parsed: crate::flow::SkillFlow =
+        serde_json::from_value(flow.clone()).map_err(|e| e.to_string())?;
+    for node in &parsed.nodes {
+        for (field, spec) in node.extract.iter().flatten() {
+            if crate::flow::extract_field(spec)?
+                .pattern
+                .is_some_and(|p| p.encode_utf16().count() > MAX_PATTERN)
             {
-                tools.push(tool.to_string());
-            }
-        }
-    }
-    tools
-}
-
-fn validate_flow_patterns(flow: &Value) -> std::result::Result<(), String> {
-    if let Some(nodes) = flow.get("nodes").and_then(Value::as_array) {
-        for node in nodes {
-            let node_id = node.get("id").and_then(Value::as_str).unwrap_or("step");
-            if let Some(extract) = node.get("extract").and_then(Value::as_object) {
-                for (field, spec) in extract {
-                    if let Some(pat) = spec.get("pattern").and_then(Value::as_str)
-                        && pat.chars().count() > 200
-                    {
-                        return Err(format!(
-                            "step {node_id}: the pattern for {field} is longer than 200 characters"
-                        ));
-                    }
-                }
+                return Err(format!(
+                    "step {}: the pattern for {field} is longer than {MAX_PATTERN} characters",
+                    node.id
+                ));
             }
         }
     }
     Ok(())
 }
 
+/// A tenant's flow with its ID set to the skill's, checked, every tool it names being allowed.
+fn tenant_flow(
+    name: &str,
+    flow: &Value,
+    tools: &[String],
+    what: &str,
+) -> std::result::Result<Value, String> {
+    let mut named = flow.clone();
+    if !named.is_object() {
+        return Err(format!("skill {name}: a flow must be an object"));
+    }
+    named["id"] = json!(name);
+    let (called, valid) = crate::flow::validate_skill_flow(&named)?;
+    for tool in &called {
+        if !tool_allowed_by_skill(tool, tools) {
+            let listed = if tools.is_empty() {
+                "none".to_string()
+            } else {
+                tools.join(", ")
+            };
+            return Err(format!(
+                "skill {name}: tool \"{tool}\" isn't {what} ({listed})"
+            ));
+        }
+    }
+    check_patterns(&valid)?;
+    Ok(valid)
+}
+
+/// Checks an override's flow against the built-in skill it changes. Its tools must be the built-in's.
+pub fn override_flow(base: &SkillConfig, flow: &Value) -> std::result::Result<Value, String> {
+    tenant_flow(&base.name, flow, &base.tools, "one of the skill's tools")
+}
+
+/// Builds a tenant's own skill. Its flow may only call tools the skill lists.
+pub fn custom_skill(
+    name: &str,
+    content: &TenantSkillContent,
+    source: Option<SkillSource>,
+) -> std::result::Result<SkillConfig, String> {
+    let description = content.description.as_deref().unwrap_or("").trim();
+    if description.is_empty() {
+        return Err(format!("skill {name}: needs a description"));
+    }
+    let tools = content.tools.clone().unwrap_or_default();
+    let body = content.body.clone().unwrap_or_default();
+    let flow = match &content.flow {
+        Some(flow) => tenant_flow(name, flow, &tools, "in the skill's tools")?,
+        None => crate::flow::synthesize_skill_flow(name, description, &tools, &body),
+    };
+    let files = content.files.clone().unwrap_or_default();
+    if let Some(path) = files.keys().find(|p| !is_valid_reference_file_path(p)) {
+        return Err(format!(
+            "skill {name}: {path:?} isn't a reference file path"
+        ));
+    }
+    Ok(SkillConfig {
+        name: name.to_string(),
+        description: description.to_string(),
+        tools,
+        keywords: content.keywords.clone().unwrap_or_default(),
+        body,
+        files,
+        flow: Some(flow),
+        source,
+    })
+}
+
+/// The built-in skills with a tenant's records applied. A record that fails its checks is skipped,
+/// so the built-in stays: control can't make these checks, because it doesn't know this image's
+/// skills.
 pub fn apply_tenant_skills(
     base: &[SkillConfig],
     records: &[TenantSkillRecord],
@@ -1210,118 +1411,32 @@ pub fn apply_tenant_skills(
             version: record.version,
             digest: record.digest.clone(),
         };
-        if record.kind == "override" {
-            let Some(builtin) = by_name.get(&record.name) else {
-                skipped(record, "there's no built-in skill of that name");
-                continue;
-            };
-            let Some(ref flow) = record.content.flow else {
-                skipped(record, "an override needs a workflow");
-                continue;
-            };
-            let tools = extract_flow_tools(flow);
-            let mut tool_err = None;
-            for tool in &tools {
-                if !tool_allowed_by_skill(tool, &builtin.tools) {
-                    tool_err = Some(format!(
-                        "tool \"{tool}\" isn't one of the skill's tools ({})",
-                        if builtin.tools.is_empty() {
-                            "none".to_string()
-                        } else {
-                            builtin.tools.join(", ")
-                        }
-                    ));
-                    break;
+        let builtin = base.iter().find(|b| b.name == record.name);
+        let applied = match record.kind.as_str() {
+            "override" => match (builtin, &record.content.flow) {
+                (None, _) => Err("there's no built-in skill of that name".to_string()),
+                (_, None) => Err("an override needs a workflow".to_string()),
+                (Some(builtin), Some(flow)) => {
+                    override_flow(builtin, flow).map(|flow| SkillConfig {
+                        flow: Some(flow),
+                        source: Some(source),
+                        ..builtin.clone()
+                    })
                 }
+            },
+            "custom" if builtin.is_some() => Err("a built-in skill has that name".to_string()),
+            "custom" => custom_skill(&record.name, &record.content, Some(source)),
+            kind => Err(format!("unknown skill kind: {kind}")),
+        };
+        match applied {
+            Ok(skill) => {
+                by_name.insert(record.name.clone(), skill);
             }
-            if let Some(err) = tool_err {
-                skipped(record, &format!("skill {}: {err}", record.name));
-                continue;
-            }
-            if let Err(e) = validate_flow_patterns(flow) {
-                skipped(record, &e);
-                continue;
-            }
-            let mut overridden = builtin.clone();
-            overridden.flow = Some(flow.clone());
-            overridden.source = Some(source);
-            by_name.insert(record.name.clone(), overridden);
-        } else if record.kind == "custom" {
-            if base.iter().any(|b| b.name == record.name) {
-                skipped(record, "a built-in skill has that name");
-                continue;
-            }
-            let description = record.content.description.as_deref().unwrap_or("").trim();
-            if description.is_empty() {
-                skipped(
-                    record,
-                    &format!("skill {}: needs a description", record.name),
-                );
-                continue;
-            }
-            let tools = record.content.tools.clone().unwrap_or_default();
-            if let Some(ref flow) = record.content.flow {
-                let flow_tools = extract_flow_tools(flow);
-                let mut tool_err = None;
-                for tool in &flow_tools {
-                    if !tool_allowed_by_skill(tool, &tools) {
-                        tool_err = Some(format!(
-                            "tool \"{tool}\" isn't in the skill's tools ({})",
-                            if tools.is_empty() {
-                                "none".to_string()
-                            } else {
-                                tools.join(", ")
-                            }
-                        ));
-                        break;
-                    }
-                }
-                if let Some(err) = tool_err {
-                    skipped(record, &format!("skill {}: {err}", record.name));
-                    continue;
-                }
-                if let Err(e) = validate_flow_patterns(flow) {
-                    skipped(record, &e);
-                    continue;
-                }
-            }
-            let mut files = BTreeMap::new();
-            let mut bad_file = false;
-            if let Some(ref rec_files) = record.content.files {
-                for (p, text) in rec_files {
-                    if !is_valid_reference_file_path(p) {
-                        skipped(
-                            record,
-                            &format!("skill {}: {p:?} isn't a reference file path", record.name),
-                        );
-                        bad_file = true;
-                        break;
-                    }
-                    files.insert(p.clone(), text.clone());
-                }
-            }
-            if bad_file {
-                continue;
-            }
-            let custom = SkillConfig {
-                name: record.name.clone(),
-                description: description.to_string(),
-                tools,
-                keywords: record.content.keywords.clone().unwrap_or_default(),
-                body: record.content.body.clone().unwrap_or_default(),
-                files,
-                flow: record.content.flow.clone(),
-                source: Some(source),
-            };
-            by_name.insert(record.name.clone(), custom);
-        } else {
-            skipped(record, &format!("unknown skill kind: {}", record.kind));
+            Err(reason) => skipped(record, &reason),
         }
     }
 
-    let mut result: Vec<_> = by_name.into_values().collect();
-    result.sort_by(|a, b| a.name.cmp(&b.name));
-    result
+    by_name.into_values().collect()
 }
 
 pub fn read_skill_file<'a>(
@@ -1439,7 +1554,8 @@ mod tests {
                         { "id": "start", "kind": "start" },
                         { "id": "call", "kind": "tool", "call": { "tool": "crm_get_forecast" } },
                         { "id": "reply", "kind": "llm_reply" }
-                    ]
+                    ],
+                    "edges": []
                 })),
                 files: None,
             },

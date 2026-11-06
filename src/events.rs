@@ -1,6 +1,9 @@
 //! Live events. Committed events reach the hub after their transaction commits; text and thinking
 //! deltas are published from memory and never written. One order covers both: a delta's ID is the
-//! last committed event's sequence plus its index after it, `<session>:<seq>.<n>`.
+//! last committed event's sequence plus its index after it, `<session>:<seq>.<n>`. `speech`
+//! events are deltas too: a session whose profile speaks cuts its text into sentences here, as
+//! agent-pi's event mapper does, flushed before `tool.started`, `message.end` and `run.finished`.
+use crate::speech::SpeechSegmenter;
 use agent_ti_store::DurableEvent;
 use serde_json::{Value, json};
 use std::{
@@ -70,7 +73,15 @@ struct Live {
     /// The newest delta dropped from the ring: a cursor before it can't resume exactly.
     dropped: Option<EventId>,
     partial: Option<Partial>,
+    speech: Option<Speech>,
     active: Instant,
+}
+/// A speaking session's segmenter, and the message whose text it has been fed.
+#[derive(Default)]
+struct Speech {
+    segmenter: SpeechSegmenter,
+    index: u64,
+    message_id: Option<String>,
 }
 impl Live {
     fn new(high_water: i64) -> Self {
@@ -82,7 +93,84 @@ impl Live {
             ring_bytes: 0,
             dropped: None,
             partial: None,
+            speech: None,
             active: Instant::now(),
+        }
+    }
+    /// Publishes one delta from memory, keeping it in the ring.
+    fn publish(&mut self, payload: Value) -> EventId {
+        let id = EventId {
+            seq: self.high_water,
+            delta: self.next_delta,
+        };
+        self.next_delta += 1;
+        self.active = Instant::now();
+        let size = payload["text"].as_str().map_or(64, str::len);
+        let published = Published {
+            id,
+            payload: Arc::new(payload),
+        };
+        self.ring.push_back(published.clone());
+        self.ring_bytes += size;
+        while self.ring.len() > RING_EVENTS || self.ring_bytes > RING_BYTES {
+            let old = self.ring.pop_front().unwrap();
+            self.ring_bytes -= old.payload["text"].as_str().map_or(64, str::len);
+            self.dropped = Some(old.id);
+        }
+        let _ = self.tx.send(published);
+        id
+    }
+    /// Feeds a message's text to the segmenter and publishes the sentences it completes.
+    fn speak(&mut self, message_id: &str, text: &str) {
+        let Some(speech) = &mut self.speech else {
+            return;
+        };
+        speech.message_id = Some(message_id.to_owned());
+        let segments = speech.segmenter.push(text);
+        self.say(segments);
+    }
+    /// Publishes whatever the segmenter holds, at a pause or the end of a message.
+    fn flush_speech(&mut self) {
+        let Some(speech) = &mut self.speech else {
+            return;
+        };
+        let segment = speech.segmenter.flush();
+        self.say(segment.into_iter().collect());
+    }
+    fn say(&mut self, segments: Vec<String>) {
+        for text in segments {
+            let speech = self.speech.as_mut().unwrap();
+            let index = speech.index;
+            speech.index += 1;
+            self.publish(json!({"type":"speech","text":text,"index":index}));
+        }
+    }
+    /// Speech for a committed event: what comes before it is flushed first, and an aborted
+    /// message's buffered text is dropped, since interrupted speech isn't finished.
+    fn speech_before(&mut self, payload: &Value) {
+        if self.speech.is_none() {
+            return;
+        }
+        match payload["type"].as_str() {
+            Some("tool.started" | "run.finished") => self.flush_speech(),
+            Some("message.end") => {
+                let speech = self.speech.as_mut().unwrap();
+                if matches!(payload["stopReason"].as_str(), Some("aborted" | "error")) {
+                    speech.segmenter.reset();
+                    speech.message_id = None;
+                    return;
+                }
+                let message = payload["messageId"].as_str().unwrap_or_default();
+                // A reply that wasn't streamed in this process, such as one recovered after a
+                // restart, is spoken whole from its `message.end`.
+                if speech.message_id.as_deref() != Some(message) {
+                    let text = payload["text"].as_str().unwrap_or_default().to_owned();
+                    self.speak(message, &text);
+                }
+                self.flush_speech();
+                self.speech.as_mut().unwrap().message_id = None;
+            }
+            _ => {}
         }
     }
 }
@@ -112,6 +200,7 @@ impl Hub {
             if event.sequence <= live.high_water {
                 continue;
             }
+            live.speech_before(&event.payload);
             live.high_water = event.sequence;
             live.next_delta = 1;
             live.active = Instant::now();
@@ -121,14 +210,29 @@ impl Hub {
             ) {
                 live.partial = None;
             }
+            let payload = Arc::new(event.payload);
             let _ = live.tx.send(Published {
                 id: EventId {
                     seq: event.sequence,
                     delta: 0,
                 },
-                payload: Arc::new(event.payload),
+                payload: payload.clone(),
             });
+            // A plugin's reply is committed as one text delta.
+            if payload["type"] == "text.delta" {
+                let message = payload["messageId"].as_str().unwrap_or_default();
+                live.speak(message, payload["text"].as_str().unwrap_or_default());
+            }
         }
+    }
+    /// Marks a session whose profile speaks, before its text arrives. `stored` is its committed
+    /// high-water mark, for a session this process hasn't seen yet.
+    pub fn speak(&self, session: &str, stored: i64) {
+        let mut sessions = self.sessions.lock().unwrap();
+        let live = sessions
+            .entry(session.to_owned())
+            .or_insert_with(|| Live::new(stored));
+        live.speech.get_or_insert_with(Speech::default);
     }
     /// Publishes a text or thinking delta from memory. A text delta also extends the partial reply.
     pub fn delta(&self, session: &str, payload: Value) {
@@ -141,37 +245,26 @@ impl Hub {
             seq: live.high_water,
             delta: live.next_delta,
         };
-        live.next_delta += 1;
-        live.active = Instant::now();
         if payload["type"] == "text.delta" {
-            let text = payload["text"].as_str().unwrap_or_default();
-            let message = payload["messageId"].as_str().unwrap_or_default();
+            let text = payload["text"].as_str().unwrap_or_default().to_owned();
+            let message = payload["messageId"].as_str().unwrap_or_default().to_owned();
             match &mut live.partial {
-                Some(p) if p.message_id == message => p.text.push_str(text),
+                Some(p) if p.message_id == message => p.text.push_str(&text),
                 partial => {
                     let turn_id = payload["turnId"].as_str().unwrap_or_default().into();
                     *partial = Some(Partial {
                         turn_id,
-                        message_id: message.into(),
-                        text: text.into(),
+                        message_id: message.clone(),
+                        text: text.clone(),
                         start: id,
                     })
                 }
             }
+            live.publish(payload);
+            live.speak(&message, &text);
+        } else {
+            live.publish(payload);
         }
-        let size = payload["text"].as_str().map_or(64, str::len);
-        let published = Published {
-            id,
-            payload: Arc::new(payload),
-        };
-        live.ring.push_back(published.clone());
-        live.ring_bytes += size;
-        while live.ring.len() > RING_EVENTS || live.ring_bytes > RING_BYTES {
-            let old = live.ring.pop_front().unwrap();
-            live.ring_bytes -= old.payload["text"].as_str().map_or(64, str::len);
-            live.dropped = Some(old.id);
-        }
-        let _ = live.tx.send(published);
     }
     /// Subscribes to a session. `stored` is its committed high-water mark in the store, for a session
     /// with no events since this process started. With a cursor, the deltas after it are returned if

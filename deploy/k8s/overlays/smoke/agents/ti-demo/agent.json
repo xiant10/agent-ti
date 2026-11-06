@@ -10,8 +10,17 @@
       "identityHeaders": "gateway"
     }
   },
+  "skillsDir": "skills",
   "defaultProfile": "chat",
-  "profiles": { "chat": { "model": "chat", "maxActiveTools": 4, "alwaysOnTools": ["tools:*"] } },
+  "profiles": {
+    "chat": { "model": "chat", "maxActiveTools": 16, "alwaysOnTools": ["tools:*", "agent_*"], "expert": { "model": "chat" } },
+    "quiet": { "model": "chat", "maxActiveTools": 16, "alwaysOnTools": ["agent_*"], "taskReports": "note" }
+  },
+  "subagents": {
+    "helper": { "description": "A helper that answers a task on its own.", "model": "chat", "instructionsFile": "helper.md", "timeoutMs": 20000 },
+    "scout": { "description": "A background scout.", "model": "chat", "background": true, "timeoutMs": 300000 },
+    "slowpoke": { "description": "A background task with a short deadline.", "model": "chat", "background": true, "timeoutMs": 500 }
+  },
   "instructions": [
     { "name": "base", "file": "base.md", "tag": false },
     { "name": "context", "file": "context.md" }
@@ -22,6 +31,6 @@
     { "use": "audit" }
   ],
   "mcpServers": [{ "name": "tools", "transport": "http", "url": "${FIXTURE_URL:-http://agent-ti-fixture:8080}/mcp" }],
-  "limits": { "maxSessionsPerUser": 100, "maxConcurrentRunsPerUser": 8, "maxToolRounds": 4 },
+  "limits": { "maxSessionsPerUser": 100000, "maxConcurrentRunsPerUser": 8, "maxToolRounds": 4, "maxTasksPerSession": 3 },
   "durable": { "stream": { "timeoutMs": 30000 }, "restartLimit": 3 }
 }

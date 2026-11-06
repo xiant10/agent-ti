@@ -1,0 +1,8 @@
+server: {role: agent, port: 18090, read_timeout: 30s, write_timeout: 300s, shutdown_timeout: 2s}
+agent_route:
+  agents: "ti-demo.agent-ti-0=http://agent-ti-0.agent-ti:18120,ti-demo.agent-ti-1=http://agent-ti-1.agent-ti:18120,ti-demo.agent-ti-2=http://agent-ti-2.agent-ti:18120"
+  default_agent: ti-demo
+  ready_interval: 1s
+  ready_timeout: 1s
+  list_timeout: 1s
+  auth: {issuer: agent-ti-fixture, url: "http://agent-ti-fixture:8080", service: ai-gateway, client_secret: test-only}

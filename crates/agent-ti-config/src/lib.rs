@@ -12,6 +12,7 @@ use std::{
 use thiserror::Error;
 
 mod agent;
+pub mod flow;
 mod host;
 mod http;
 pub use agent::*;

@@ -268,6 +268,7 @@ async fn test_grant_broker_full_lifecycle() {
             config_version: "test".into(),
             origin: json!({"trigger": "user"}),
             metadata: json!({}),
+            child: None,
         })
         .await
         .unwrap();
@@ -327,6 +328,7 @@ async fn test_grant_broker_full_lifecycle() {
             config_version: "test".into(),
             origin: json!({"trigger": "user"}),
             metadata: json!({}),
+            child: None,
         })
         .await
         .unwrap();
@@ -407,6 +409,7 @@ async fn test_grant_broker_retries_and_errors() {
             config_version: "test".into(),
             origin: json!({"trigger": "user"}),
             metadata: json!({}),
+            child: None,
         })
         .await
         .unwrap();

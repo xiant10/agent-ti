@@ -5,9 +5,13 @@
       "provider": "openai-compatible",
       "modelId": "scripted",
       "baseUrl": "${FIXTURE_URL:-http://agent-ti-fixture:8080}/v1",
-      "identityHeaders": "gateway"
+      "identityHeaders": "gateway",
+      "contextWindow": 3000,
+      "maxOutputTokens": 256
     }
   },
   "profiles": { "chat": { "model": "chat", "maxActiveTools": 0 } },
-  "instructions": [{ "name": "base", "file": "base.md", "tag": false }]
+  "instructions": [{ "name": "base", "file": "base.md", "tag": false }],
+  "limits": { "maxSessionsPerUser": 100000 },
+  "durable": { "compaction": { "enabled": true, "reserveTokens": 500, "keepRecentTokens": 300 } }
 }

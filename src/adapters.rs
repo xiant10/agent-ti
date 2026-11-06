@@ -105,6 +105,11 @@ pub async fn model(
     }
     let response = req.send().await.map_err(|_| ExecutionError::Unavailable)?;
     if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE || context_overflow(&body) {
+            return Err(ExecutionError::ContextOverflow);
+        }
         return Err(ExecutionError::Unavailable);
     }
     let mut stream = response.bytes_stream();
@@ -493,4 +498,38 @@ pub async fn mcp_call(
             }
         }
     }
+}
+
+/// pi-ai's `isContextOverflow` for an error body: a provider's way of saying the request is longer
+/// than the model's context window, and not a rate limit.
+pub fn context_overflow(body: &str) -> bool {
+    static OVERFLOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"(?i)prompt (?:is )?too long|prompt exceeds max length|request_too_large|",
+            r"input is too long for requested model|exceeds the context window|",
+            r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))|",
+            r"input token count.*exceeds the maximum|maximum prompt length is \d+|",
+            r"reduce the length of the messages|maximum context length is \d+ tokens|",
+            r"exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?|",
+            r"input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)|",
+            r"exceeds the limit of \d+|exceeds the available context size|greater than the context length|",
+            r"context window exceeds limit|exceeded model token limit|too large for model with \d+ maximum context length|",
+            r"prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?|",
+            r"model_context_window_exceeded|prompt too long; exceeded (?:max )?context length|",
+            r"range of input length should be|context[_ ]length[_ ]exceeded|too many tokens|token limit exceeded"
+        ))
+        .unwrap()
+    });
+    static NOT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)^(Throttling error|Service unavailable):|rate limit|too many requests",
+        )
+        .unwrap()
+    });
+    let mut end = body.len().min(64 * 1024);
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let body = &body[..end];
+    !NOT.is_match(body) && OVERFLOW.is_match(body)
 }

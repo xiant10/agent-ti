@@ -126,7 +126,7 @@ fn unknown_fields_stop_startup_and_unported_ones_warn() {
     }
     let with_unported = MINIMAL.replace(
         "\"agent\": \"ti\",",
-        "\"agent\": \"ti\", \"subagents\": {\"x\": {}}, \"port\": 1,",
+        "\"agent\": \"ti\", \"mcpEndpoint\": {}, \"port\": 1,",
     );
     write(dir.path(), &[("ti/agent.json", &with_unported)]);
     let config = load_agent(
@@ -134,7 +134,7 @@ fn unknown_fields_stop_startup_and_unported_ones_warn() {
         &env(&[]),
     )
     .unwrap();
-    assert!(config.unported.iter().any(|u| u.starts_with("subagents")));
+    assert!(config.unported.iter().any(|u| u.starts_with("mcpEndpoint")));
     assert_eq!(config.host_fields, ["port"]);
 }
 #[test]
@@ -295,6 +295,7 @@ impl RequestContext for NoMemo {
 fn turn(text: &str) -> Turn<'_> {
     Turn {
         text,
+        note: None,
         agent: "ti",
         session_id: "s",
         tenant_id: "t",
@@ -335,9 +336,20 @@ async fn the_plugin_library_matches_agent_pi() {
             .before_prompt(&turn("my card is 4111 1111 1111 1111"))
             .await
             .unwrap(),
-        Some(PromptDecision::Input(
-            "my card is [card number removed]".into()
-        ))
+        Some(PromptDecision::Rewrite {
+            text: "my card is [card number removed]".into(),
+            note: None,
+        })
+    );
+    // A card number in the turn's note is removed as well, as agent-pi's guardrails do.
+    let mut noted = turn("pay it");
+    noted.note = Some("heard: 4111 1111 1111 1111");
+    assert_eq!(
+        guardrails.before_prompt(&noted).await.unwrap(),
+        Some(PromptDecision::Rewrite {
+            text: "pay it".into(),
+            note: Some("heard: [card number removed]".into()),
+        })
     );
     assert_eq!(
         guardrails
@@ -418,4 +430,56 @@ async fn the_plugin_library_matches_agent_pi() {
             result.err()
         );
     }
+}
+#[test]
+fn sub_agents_and_the_expert_follow_agent_pi() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = MINIMAL
+        .replace(
+            "\"maxActiveTools\": \"${TOOLS:-8}\"}",
+            "\"maxActiveTools\": 8, \"expert\": {\"model\": \"chat\"}}",
+        )
+        .replace(
+            "\"agent\": \"ti\",",
+            "\"agent\": \"ti\", \"subagents\": {\"research\": {\"description\": \"Research.\", \"model\": \"chat\", \"instructionsFile\": \"research.md\", \"tools\": [\"crm_*\", \"search_tools\"]}},",
+        );
+    write(
+        dir.path(),
+        &[
+            ("ti/agent.json", &config),
+            ("ti/base.md", "x"),
+            ("ti/research.md", "Dig deep."),
+        ],
+    );
+    let config = load_agent(
+        &FileSource::snapshot(&dir.path().join("ti/agent.json")).unwrap(),
+        &env(&[]),
+    )
+    .unwrap();
+    let research = &config.subagents[0];
+    assert_eq!(research.name, "research");
+    assert_eq!(research.thinking_level, "off");
+    assert_eq!(research.timeout_ms, 300_000);
+    assert_eq!(research.instructions.as_deref(), Some("Dig deep."));
+    assert_eq!(research.tools, ["crm_*", "search_tools"]);
+    let expert = config.profiles["chat"].expert.as_ref().unwrap();
+    assert_eq!(
+        (expert.model.as_str(), expert.thinking_level.as_str()),
+        ("chat", "high")
+    );
+    assert_eq!(config.limits.max_subagents_per_session, 3);
+    assert!(config.unported.is_empty(), "{:?}", config.unported);
+    // A sub-agent naming an unknown model stops startup.
+    let bad = MINIMAL.replace(
+        "\"agent\": \"ti\",",
+        "\"agent\": \"ti\", \"subagents\": {\"x\": {\"description\": \"X.\", \"model\": \"nope\"}},",
+    );
+    write(dir.path(), &[("ti/agent.json", &bad)]);
+    let error = load_agent(
+        &FileSource::snapshot(&dir.path().join("ti/agent.json")).unwrap(),
+        &env(&[]),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("subagents.x.model"), "{error}");
 }

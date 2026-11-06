@@ -1,6 +1,12 @@
 //! The scheduler, in memory and spanning every agent's store, and the session worker: the
 //! model/tool loop with each external call journaled as a step.
-use crate::{adapters, agents::Agent, server::Host};
+use crate::{
+    adapters,
+    agents::{Agent, ToolEntry},
+    compaction,
+    flow::FlowRunTrace,
+    server::Host,
+};
 use agent_ti_core::*;
 use agent_ti_plugin_sdk::{RequestContext, RunInfo};
 use agent_ti_store::*;
@@ -11,7 +17,7 @@ use std::{
         Arc, Mutex, RwLock,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{sync::Notify, task::JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -28,6 +34,23 @@ struct Running {
     tick: u64,
     tokens: HashMap<String, CancellationToken>,
     session_tools: HashMap<(String, String, String), usize>,
+    /// Background children's runs per user (`maxBackgroundRunsPerUser`).
+    background: HashMap<(String, String, String), usize>,
+}
+/// How a command counts against run limits: a foreground child's holds none (its parent's run
+/// does); a background child's counts toward process capacity and its owner's background runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lease {
+    Run,
+    Foreground,
+    Background,
+}
+fn lease(child: Option<&serde_json::Value>) -> Lease {
+    match child {
+        None => Lease::Run,
+        Some(spec) if spec.get("task").is_some() => Lease::Background,
+        Some(_) => Lease::Foreground,
+    }
 }
 #[derive(Default)]
 pub struct Scheduler {
@@ -36,6 +59,10 @@ pub struct Scheduler {
 }
 impl Scheduler {
     /// New work was admitted or a run ended.
+    /// Runs in progress, for metrics.
+    pub fn active(&self) -> usize {
+        self.running.lock().unwrap().total
+    }
     pub fn wake(&self) {
         self.wake.notify_one();
     }
@@ -67,15 +94,27 @@ impl Scheduler {
     }
     fn release(&self, agent: &str, w: &Work) {
         let mut r = self.running.lock().unwrap();
-        r.total -= 1;
-        *r.tenants.get_mut(&w.scope.tenant_id).unwrap() -= 1;
-        *r.users
-            .get_mut(&(
-                agent.to_owned(),
-                w.scope.tenant_id.clone(),
-                w.scope.user_id.clone(),
-            ))
-            .unwrap() -= 1;
+        let user = (
+            agent.to_owned(),
+            w.scope.tenant_id.clone(),
+            w.scope.user_id.clone(),
+        );
+        if lease(w.child.as_ref()) == Lease::Background {
+            r.total -= 1;
+            *r.background.get_mut(&user).unwrap() -= 1;
+        }
+        // A foreground child's run holds no slot: its parent's does, as agent-pi's `RunTracker`.
+        if w.child.is_none() {
+            r.total -= 1;
+            *r.tenants.get_mut(&w.scope.tenant_id).unwrap() -= 1;
+            *r.users
+                .get_mut(&(
+                    agent.to_owned(),
+                    w.scope.tenant_id.clone(),
+                    w.scope.user_id.clone(),
+                ))
+                .unwrap() -= 1;
+        }
         r.tokens.remove(&w.command_id);
         r.session_tools.remove(&(
             agent.to_string(),
@@ -87,7 +126,10 @@ impl Scheduler {
     }
 }
 
-fn error(e: StoreError) -> ExecutionError {
+fn is_child_tool(name: &str) -> bool {
+    name == crate::agents::EXPERT_TOOL || name.starts_with(crate::agents::SUBAGENT_PREFIX)
+}
+pub(crate) fn error(e: StoreError) -> ExecutionError {
     match e {
         StoreError::Conflict => ExecutionError::Denied,
         _ => ExecutionError::Unavailable,
@@ -116,6 +158,10 @@ struct Journal {
     model_index: AtomicUsize,
     tools: Arc<RwLock<Vec<Arc<crate::agents::OfferedTool>>>>,
     streamed: Arc<Mutex<Streamed>>,
+    /// Ahead of every step ID of this run's generation (`generation_prefix`).
+    prefix: String,
+    /// The profile's, or a child's own.
+    thinking_level: String,
 }
 /// The current model message: its ID, and the text streamed of it so far.
 #[derive(Default)]
@@ -130,9 +176,23 @@ struct LiveText<'a> {
     /// UTF-16 code units sent so far, as JavaScript clients count them.
     offset: usize,
     thinking: bool,
+    started: Instant,
+    first: bool,
+}
+impl LiveText<'_> {
+    fn first_token(&mut self) {
+        if std::mem::take(&mut self.first) {
+            self.journal.host.metrics.observe(
+                "agent_ti_first_token_seconds",
+                &[("agent", &self.journal.agent.name)],
+                self.started.elapsed(),
+            );
+        }
+    }
 }
 impl adapters::DeltaSink for LiveText<'_> {
     fn text(&mut self, text: &str) {
+        self.first_token();
         let w = &self.journal.work;
         let payload = json!({"type":"text.delta","turnId":w.turn_id,"messageId":self.message_id,"generationId":format!("{}:{}",w.command_id,w.attempt),"offset":self.offset,"text":text});
         self.offset += text.encode_utf16().count();
@@ -140,6 +200,7 @@ impl adapters::DeltaSink for LiveText<'_> {
         self.journal.agent.hub.delta(&w.session_id, payload);
     }
     fn thinking(&mut self, text: &str) {
+        self.first_token();
         if self.thinking {
             let w = &self.journal.work;
             self.journal.agent.hub.delta(
@@ -168,7 +229,7 @@ impl RequestContext for Memo<'_> {
     ) -> BoxFuture<'a, Result<Value, String>> {
         Box::pin(async move {
             let j = self.journal;
-            let id = format!("memo:{}:{name}", self.plugin);
+            let id = format!("{}memo:{}:{name}", j.prefix, self.plugin);
             let op = Operation {
                 id: id.clone(),
                 kind: "memo".into(),
@@ -204,7 +265,7 @@ impl ModelPort for Journal {
     ) -> BoxFuture<'a, Result<ModelReply, ExecutionError>> {
         Box::pin(async move {
             let index = self.model_index.fetch_add(1, Ordering::SeqCst);
-            let id = format!("model:{index}");
+            let id = format!("{}model:{index}", self.prefix);
             let message_id = format!("{}:{index}", self.work.command_id);
             *self.streamed.lock().unwrap() = Streamed {
                 message_id: Some(message_id.clone()),
@@ -235,7 +296,8 @@ impl ModelPort for Journal {
                     journal: self,
                     plugin: plugin.name(),
                 };
-                request.messages = plugin.before_model_request(request.messages, &ctx).await.map_err(|e| {
+                let limit = self.hook_limit();
+                request.messages = crate::plugins::within(limit, "before_model_request", plugin.before_model_request(request.messages, &ctx)).await.map_err(|e| {
                     tracing::error!(agent = %self.agent.name, plugin = plugin.name(), error = %e, "before_model_request failed");
                     ExecutionError::Denied
                 })?;
@@ -244,7 +306,7 @@ impl ModelPort for Journal {
             let call = adapters::ModelCall {
                 config: &self.agent.config.models[&request.model],
                 agent: &self.agent.name,
-                thinking_level: &profile.thinking_level,
+                thinking_level: &self.thinking_level,
                 timeout: Duration::from_millis(self.agent.config.durable.stream_timeout_ms),
             };
             let mut live = LiveText {
@@ -252,6 +314,8 @@ impl ModelPort for Journal {
                 message_id: message_id.clone(),
                 offset: 0,
                 thinking: profile.thinking_events,
+                started: Instant::now(),
+                first: true,
             };
             let reply =
                 adapters::model(&self.host.client, call, &self.work, request, &mut live).await?;
@@ -260,7 +324,15 @@ impl ModelPort for Journal {
                     journal: self,
                     plugin: plugin.name(),
                 };
-                let _ = plugin.after_model_response(&reply.message, &ctx).await;
+                let observed = crate::plugins::within(
+                    self.hook_limit(),
+                    "after_model_response",
+                    plugin.after_model_response(&reply.message, &ctx),
+                )
+                .await;
+                if let Err(e) = observed {
+                    tracing::warn!(agent = %self.agent.name, plugin = plugin.name(), error = %e, "after_model_response failed");
+                }
             }
             let value =
                 serde_json::to_value(&reply).map_err(|_| ExecutionError::InvalidResponse)?;
@@ -271,15 +343,222 @@ impl ModelPort for Journal {
             });
             self.agent
                 .store
-                .record(&self.work, &id, value, end)
+                .record_spent(
+                    &self.work,
+                    &id,
+                    value,
+                    end,
+                    (reply.input_tokens, reply.output_tokens),
+                )
                 .await
                 .map_err(error)?;
+            for (kind, tokens) in [
+                ("input", reply.input_tokens),
+                ("output", reply.output_tokens),
+            ] {
+                self.host.metrics.add(
+                    "agent_ti_tokens_total",
+                    &[("agent", &self.agent.name), ("kind", kind)],
+                    tokens,
+                );
+            }
+            if reply.message.tool_calls.is_empty() {
+                self.move_flow(crate::flow::complete_after_answer).await;
+            }
             Ok(reply)
         })
     }
 }
 impl Journal {
-    async fn execute_load_skill(&self, call: &ToolCall) -> ToolOutcome {
+    fn hook_limit(&self) -> Duration {
+        Duration::from_millis(self.host.config.limits.hook_timeout_ms)
+    }
+    /// Which server a tool's latency counts under.
+    fn server_of<'t>(&'t self, tool: &'t ToolEntry) -> &'t str {
+        if let Some(conn) = &tool.connector {
+            return &conn.connector_name;
+        }
+        self.agent
+            .config
+            .mcp_servers
+            .get(tool.server)
+            .map_or("agent", |server| server.name.as_str())
+    }
+    /// Changes the session's running flow trace, if it has one. The trace is a picture of the run;
+    /// failing to draw it doesn't stop the run.
+    async fn move_flow(&self, change: impl FnOnce(&mut FlowRunTrace) + Send) {
+        let moved = self
+            .agent
+            .store
+            .advance_flow(&self.work.scope, &self.work.session_id, |value| {
+                let mut trace: FlowRunTrace = serde_json::from_value(value).ok()?;
+                change(&mut trace);
+                serde_json::to_value(trace).ok()
+            })
+            .await;
+        if let Err(e) = moved {
+            tracing::warn!(session_id = %self.work.session_id, error = ?e, "flow trace not updated");
+        }
+    }
+    /// Runs a tool of the catalog: a plugin's, a tenant connector's or an MCP server's.
+    async fn call_entry(&self, tool: &ToolEntry, arguments: Value) -> ToolOutcome {
+        if let Some(ref handler) = tool.handler {
+            return (handler)(arguments).await;
+        }
+        if let Some(ref conn) = tool.connector {
+            if conn.tenant_id != self.work.scope.tenant_id {
+                return ToolOutcome::error(format!(
+                    "Tool {} belongs to another tenant.",
+                    tool.name
+                ));
+            }
+            let Some(ref tc) = self.agent.tenant_connectors else {
+                return ToolOutcome::error("Tenant connectors are not configured.");
+            };
+            let grant_token = match self.grant_token(&tool.name).await {
+                Ok(token) => token,
+                Err(outcome) => return outcome,
+            };
+            let srv = agent_ti_config::McpServerConfig {
+                name: conn.connector_name.clone(),
+                url: format!(
+                    "{}/mcp/connector/{}",
+                    tc.gateway_url().trim_end_matches('/'),
+                    conn.connector_id
+                ),
+                auth: agent_ti_config::McpAuth::Grant { token_header: None },
+                headers: std::collections::BTreeMap::new(),
+                include: vec![],
+                exclude: vec![],
+                prefix: String::new(),
+                max_description_chars: 1000,
+                call_timeout_ms: 30_000,
+                agent_context: false,
+            };
+            return adapters::mcp_call(
+                &self.host.client,
+                &srv,
+                &tool.mcp_name,
+                arguments,
+                Some(&grant_token),
+                None,
+            )
+            .await;
+        }
+        let Some(server) = self.agent.config.mcp_servers.get(tool.server) else {
+            return ToolOutcome::error(format!("Tool {} not found", tool.name));
+        };
+        let grant_token = if let agent_ti_config::McpAuth::Grant { .. } = &server.auth {
+            match self.grant_token(&tool.name).await {
+                Ok(token) => Some(token),
+                Err(outcome) => return outcome,
+            }
+        } else {
+            None
+        };
+        let meta = if server.agent_context {
+            let mut m = json!({ "turn": self.work.turn_id });
+            if let Some(ref tp) = self.work.traceparent {
+                m["traceparent"] = json!(tp);
+            }
+            Some(m)
+        } else {
+            None
+        };
+        adapters::mcp_call(
+            &self.host.client,
+            server,
+            &tool.mcp_name,
+            arguments,
+            grant_token.as_deref(),
+            meta,
+        )
+        .await
+    }
+    async fn grant_token(&self, tool: &str) -> Result<String, ToolOutcome> {
+        let Some(ref broker) = self.agent.grants else {
+            return Err(ToolOutcome::error(format!(
+                "{tool} needs an agent grant, and this agent has none configured."
+            )));
+        };
+        broker
+            .token(&self.agent.store, &self.work.session_id)
+            .await
+            .map_err(|e| match e {
+                crate::grants::GrantError::Stopped => ToolOutcome::error(
+                    "The agent's access was stopped; end this task and tell the user.",
+                ),
+                crate::grants::GrantError::Expired => ToolOutcome::error(
+                    "The agent's access has expired; ask the user to send a message to renew it.",
+                ),
+                crate::grants::GrantError::Unavailable(e) => {
+                    ToolOutcome::error(format!("the auth service is unavailable: {e}"))
+                }
+            })
+    }
+    /// What `load_skill` adds for a skill's flow: a deterministic flow given a query runs now and
+    /// returns what it found; any other starts a trace for the model's own tool calls to move.
+    async fn run_skill_flow(
+        &self,
+        step: &str,
+        skill: &agent_ti_config::SkillConfig,
+        flow: &Value,
+        query: Option<&str>,
+        has_tools: bool,
+    ) -> Result<String, String> {
+        let flow: agent_ti_config::flow::SkillFlow =
+            serde_json::from_value(flow.clone()).map_err(|e| e.to_string())?;
+        if let Some(query) = query.filter(|_| flow.mode == "deterministic" && has_tools) {
+            let host = SkillFlowHost {
+                journal: self,
+                step,
+            };
+            let result =
+                crate::flow::execute_flow(&flow, query, crate::flow::language_of(query), &host)
+                    .await?;
+            return Ok(match (result.immediate_reply, result.evidence) {
+                (Some(reply), _) if result.status == "needs_input" => {
+                    format!("\n\n<flow_needs_input>\n{reply}\n</flow_needs_input>")
+                }
+                (_, Some(evidence)) => format!("\n\n{evidence}"),
+                _ => String::new(),
+            });
+        }
+        let trace = crate::flow::guided_trace(&flow, &skill.name);
+        self.save_flow(trace).await;
+        Ok(String::new())
+    }
+    async fn save_flow(&self, trace: FlowRunTrace) {
+        let saved = match serde_json::to_value(trace) {
+            Ok(value) => {
+                self.agent
+                    .store
+                    .set_flow(&self.work.scope, &self.work.session_id, value)
+                    .await
+            }
+            Err(_) => Err(agent_ti_store::StoreError::Invalid),
+        };
+        if let Err(e) = saved {
+            tracing::warn!(session_id = %self.work.session_id, error = ?e, "flow trace not saved");
+        }
+    }
+    /// A flow's tool, by the name the flow gives it: the catalog's name, or an MCP tool's on any
+    /// server. Only what this tenant may use is found.
+    async fn flow_tool(&self, name: &str) -> Option<Arc<crate::agents::OfferedTool>> {
+        let tenant = &self.work.scope.tenant_id;
+        let names = self
+            .agent
+            .match_tools(&[name.to_string(), format!("*:{name}")], tenant)
+            .await;
+        let found = names.iter().find(|n| *n == name).or(names.first())?.clone();
+        let profile = &self.agent.config.profiles[&self.work.profile];
+        self.agent
+            .offered(tenant, profile, &[found])
+            .await
+            .into_iter()
+            .next()
+    }
+    async fn execute_load_skill(&self, step: &str, call: &ToolCall) -> ToolOutcome {
         let name = match call.arguments.get("name").and_then(Value::as_str) {
             Some(n) if !n.is_empty() => n,
             _ => {
@@ -381,7 +660,30 @@ impl Journal {
             String::new()
         };
 
-        ToolOutcome::ok(format!("{}{}{}", skill.body, footer, files_appendix))
+        let flow_appendix = match &skill.flow {
+            Some(flow) => {
+                let query = call.arguments.get("query").and_then(Value::as_str);
+                let has_tools = !matched_names.is_empty();
+                match self
+                    .run_skill_flow(step, skill, flow, query, has_tools)
+                    .await
+                {
+                    Ok(appendix) => appendix,
+                    Err(e) => return ToolOutcome::error(e),
+                }
+            }
+            None => String::new(),
+        };
+
+        let content = format!("{}{footer}{files_appendix}{flow_appendix}", skill.body);
+        // A flow can bring back several tools' results at once; the journal holds a bounded step.
+        if content.len() > agent_ti_core::MAX_TOOL_RESULT_BYTES {
+            return ToolOutcome::error(format!(
+                "Skill {name}'s flow found more than {} KiB. Use the skill's tools directly, with narrower queries.",
+                agent_ti_core::MAX_TOOL_RESULT_BYTES / 1024
+            ));
+        }
+        ToolOutcome::ok(content)
     }
 
     async fn execute_search_tools(&self, call: &ToolCall) -> ToolOutcome {
@@ -462,18 +764,23 @@ impl ToolPort for Journal {
                 .cloned();
             // Model call IDs repeat across rounds with some providers, so the step ID names the round.
             let round = self.model_index.load(Ordering::SeqCst).saturating_sub(1);
-            let id = format!("tool:{round}:{}", call.id);
+            let id = format!("{}tool:{round}:{}", self.prefix, call.id);
             let call_id = call.id.clone();
             let call_name = call.name.clone();
+            let call_name_for_flow = call.name.clone();
             let turn_id = self.work.turn_id.clone();
             let finished = move |o: &ToolOutcome| {
                 Some(
                     json!({"type":"tool.finished","turnId":turn_id,"callId":call_id,"name":call_name,"isError":o.is_error}),
                 )
             };
-            let unsafe_effect = tool
-                .as_ref()
-                .is_some_and(|t| t.name != "load_skill" && t.name != "search_tools");
+            // A child's tool is safe to rerun: it finds the same child and the same submission.
+            let unsafe_effect = tool.as_ref().is_some_and(|t| {
+                t.name != "load_skill"
+                    && t.name != "search_tools"
+                    && !is_child_tool(&t.name)
+                    && !crate::tasks::is_task_tool(&t.name)
+            });
             let op = Operation {
                 id: id.clone(),
                 kind: "tool".into(),
@@ -510,8 +817,22 @@ impl ToolPort for Journal {
                             journal: self,
                             plugin: plugin.name(),
                         };
-                        match plugin.before_tool_call(&call, &ctx).await {
-                            Ok(Some(agent_ti_plugin_sdk::ToolCallDecision::Block(reason))) => {
+                        let decision = crate::plugins::within(
+                            self.hook_limit(),
+                            "before_tool_call",
+                            plugin.before_tool_call(&call, &ctx),
+                        )
+                        .await
+                        // A security hook that can't answer refuses.
+                        .unwrap_or_else(|e| {
+                            tracing::error!(agent = %self.agent.name, plugin = plugin.name(), error = %e, "before_tool_call failed; refusing the call");
+                            Some(agent_ti_plugin_sdk::ToolCallDecision::Block(format!(
+                                "{} refused this call: its check failed.",
+                                plugin.name()
+                            )))
+                        });
+                        match decision {
+                            Some(agent_ti_plugin_sdk::ToolCallDecision::Block(reason)) => {
                                 let outcome = ToolOutcome::error(reason);
                                 self.agent
                                     .store
@@ -525,12 +846,10 @@ impl ToolPort for Journal {
                                     .map_err(error)?;
                                 return Ok(outcome);
                             }
-                            Ok(Some(agent_ti_plugin_sdk::ToolCallDecision::Arguments(
-                                new_args,
-                            ))) => {
+                            Some(agent_ti_plugin_sdk::ToolCallDecision::Arguments(new_args)) => {
                                 call.arguments = new_args;
                             }
-                            _ => {}
+                            None => {}
                         }
                     }
                     let Some(tool) = tool else {
@@ -574,133 +893,34 @@ impl ToolPort for Journal {
                             .map_err(error)?;
                         return Ok(outcome);
                     }
+                    let tool_started = Instant::now();
                     let mut outcome = if tool.name == "load_skill" {
-                        self.execute_load_skill(&call).await
+                        self.execute_load_skill(&id, &call).await
                     } else if tool.name == "search_tools" {
                         self.execute_search_tools(&call).await
-                    } else if let Some(ref handler) = tool.handler {
-                        (handler)(call.arguments.clone()).await
-                    } else if let Some(ref conn) = tool.connector {
-                        if conn.tenant_id != self.work.scope.tenant_id {
-                            return Ok(ToolOutcome::error(format!(
-                                "Tool {} belongs to another tenant.",
-                                tool.name
-                            )));
-                        }
-                        let Some(ref tc) = self.agent.tenant_connectors else {
-                            return Ok(ToolOutcome::error("Tenant connectors are not configured."));
-                        };
-                        let grant_token = match self.agent.grants {
-                            Some(ref broker) => {
-                                match broker.token(&self.agent.store, &self.work.session_id).await {
-                                    Ok(tok) => tok,
-                                    Err(crate::grants::GrantError::Stopped) => {
-                                        return Ok(ToolOutcome::error(
-                                            "The agent's access was stopped; end this task and tell the user.",
-                                        ));
-                                    }
-                                    Err(crate::grants::GrantError::Expired) => {
-                                        return Ok(ToolOutcome::error(
-                                            "The agent's access has expired; ask the user to send a message to renew it.",
-                                        ));
-                                    }
-                                    Err(crate::grants::GrantError::Unavailable(e)) => {
-                                        return Ok(ToolOutcome::error(format!(
-                                            "the auth service is unavailable: {e}"
-                                        )));
-                                    }
-                                }
-                            }
-                            None => {
-                                return Ok(ToolOutcome::error(format!(
-                                    "{} needs an agent grant, and this agent has none configured.",
-                                    tool.name
-                                )));
-                            }
-                        };
-                        let srv = agent_ti_config::McpServerConfig {
-                            name: conn.connector_name.clone(),
-                            url: format!(
-                                "{}/mcp/connector/{}",
-                                tc.gateway_url().trim_end_matches('/'),
-                                conn.connector_id
-                            ),
-                            auth: agent_ti_config::McpAuth::Grant { token_header: None },
-                            headers: std::collections::BTreeMap::new(),
-                            include: vec![],
-                            exclude: vec![],
-                            prefix: String::new(),
-                            max_description_chars: 1000,
-                            call_timeout_ms: 30_000,
-                            agent_context: false,
-                        };
-                        adapters::mcp_call(
-                            &self.host.client,
-                            &srv,
-                            &tool.mcp_name,
-                            call.arguments.clone(),
-                            Some(&grant_token),
-                            None,
+                    } else if crate::tasks::is_task_tool(&tool.name) && tool.handler.is_none() {
+                        crate::tasks::run_tool(&self.host, &self.agent, &self.work, &id, &call)
+                            .await
+                    } else if is_child_tool(&tool.name) && tool.handler.is_none() {
+                        crate::children::run_child(
+                            self.host.clone(),
+                            self.agent.clone(),
+                            &self.work,
+                            &id,
+                            &call,
                         )
                         .await
                     } else {
-                        let server = &self.agent.config.mcp_servers[tool.server];
-                        let grant_token = if let agent_ti_config::McpAuth::Grant { .. } =
-                            &server.auth
-                        {
-                            match self.agent.grants {
-                                Some(ref broker) => {
-                                    match broker
-                                        .token(&self.agent.store, &self.work.session_id)
-                                        .await
-                                    {
-                                        Ok(tok) => Some(tok),
-                                        Err(crate::grants::GrantError::Stopped) => {
-                                            return Ok(ToolOutcome::error(
-                                                "The agent's access was stopped; end this task and tell the user.",
-                                            ));
-                                        }
-                                        Err(crate::grants::GrantError::Expired) => {
-                                            return Ok(ToolOutcome::error(
-                                                "The agent's access has expired; ask the user to send a message to renew it.",
-                                            ));
-                                        }
-                                        Err(crate::grants::GrantError::Unavailable(e)) => {
-                                            return Ok(ToolOutcome::error(format!(
-                                                "the auth service is unavailable: {e}"
-                                            )));
-                                        }
-                                    }
-                                }
-                                None => {
-                                    return Ok(ToolOutcome::error(format!(
-                                        "{} needs an agent grant, and this agent has none configured.",
-                                        tool.name
-                                    )));
-                                }
-                            }
-                        } else {
-                            None
-                        };
-                        let meta = if server.agent_context {
-                            let mut m = json!({ "turn": self.work.turn_id });
-                            if let Some(ref tp) = self.work.traceparent {
-                                m["traceparent"] = json!(tp);
-                            }
-                            Some(m)
-                        } else {
-                            None
-                        };
-                        adapters::mcp_call(
-                            &self.host.client,
-                            server,
-                            &tool.mcp_name,
-                            call.arguments.clone(),
-                            grant_token.as_deref(),
-                            meta,
-                        )
-                        .await
+                        self.call_entry(&tool, call.arguments.clone()).await
                     };
+                    self.host.metrics.observe(
+                        "agent_ti_tool_seconds",
+                        &[
+                            ("agent", &self.agent.name),
+                            ("server", self.server_of(&tool)),
+                        ],
+                        tool_started.elapsed(),
+                    );
                     for plugin in &self.agent.plugins {
                         outcome = plugin.after_tool_call(&call, outcome);
                     }
@@ -720,8 +940,88 @@ impl ToolPort for Journal {
                 .record(&self.work, &id, value, finished(&outcome))
                 .await
                 .map_err(error)?;
+            if call_name_for_flow != "load_skill" {
+                self.move_flow(|trace| {
+                    crate::flow::advance_after_tool(trace, &call_name_for_flow, outcome.is_error)
+                })
+                .await;
+            }
             Ok(outcome)
         })
+    }
+}
+
+/// A flow's tool calls, each its own journaled step: after a crash, a call that finished is reused,
+/// and an unsafe one that was cut off comes back as `interrupted` rather than running again.
+struct SkillFlowHost<'a> {
+    journal: &'a Journal,
+    step: &'a str,
+}
+
+impl crate::flow::FlowHost for SkillFlowHost<'_> {
+    fn call_tool(
+        &self,
+        step: String,
+        name: String,
+        args: Value,
+    ) -> BoxFuture<'_, crate::flow::ToolCallOutcome> {
+        Box::pin(async move {
+            let outcome = self.journaled(&step, &name, args).await;
+            crate::flow::ToolCallOutcome {
+                output: outcome.content,
+                is_error: outcome.is_error,
+            }
+        })
+    }
+    fn update(&self, trace: FlowRunTrace) -> BoxFuture<'_, ()> {
+        Box::pin(self.journal.save_flow(trace))
+    }
+}
+
+impl SkillFlowHost<'_> {
+    async fn journaled(&self, step: &str, name: &str, args: Value) -> ToolOutcome {
+        let journal = self.journal;
+        let id = format!("{}:flow:{step}", self.step);
+        let op = Operation {
+            id: id.clone(),
+            kind: "tool".into(),
+            input: json!({"name": name, "arguments": args}),
+            unsafe_effect: true,
+            event: None,
+        };
+        let outcome = match journal.agent.store.prepare(&journal.work, op).await {
+            Err(e) => return ToolOutcome::error(format!("{name}: {e:?}")),
+            Ok(Prepared::Recorded(result)) => {
+                return serde_json::from_value(result).unwrap_or_else(|_| {
+                    ToolOutcome::error(format!("{name}: the recorded result can't be read"))
+                });
+            }
+            Ok(Prepared::Interrupted) => ToolOutcome::error(
+                "interrupted: this call was cut off by a restart and was not repeated. It may or may not have taken effect.",
+            ),
+            Ok(Prepared::Run) => match journal.flow_tool(name).await {
+                Some(tool) => journal.call_entry(&tool, args).await,
+                None => ToolOutcome::error(format!("Tool {name} not found")),
+            },
+        };
+        let outcome = if outcome.content.len() > agent_ti_core::MAX_TOOL_RESULT_BYTES {
+            ToolOutcome::error(format!(
+                "{name} returned more than {} KiB.",
+                agent_ti_core::MAX_TOOL_RESULT_BYTES / 1024
+            ))
+        } else {
+            outcome
+        };
+        let value = serde_json::to_value(&outcome).unwrap_or(Value::Null);
+        if let Err(e) = journal
+            .agent
+            .store
+            .record(&journal.work, &id, value, None)
+            .await
+        {
+            return ToolOutcome::error(format!("{name}: {e:?}"));
+        }
+        outcome
     }
 }
 
@@ -736,7 +1036,13 @@ impl ExecutionHooks for Journal {
                     journal: self,
                     plugin: plugin.name(),
                 };
-                match plugin.on_final_answer(answer, &ctx).await {
+                match crate::plugins::within(
+                    self.hook_limit(),
+                    "on_final_answer",
+                    plugin.on_final_answer(answer, &ctx),
+                )
+                .await
+                {
                     Ok(Some(continuation)) => return Ok(Some(continuation)),
                     Err(e) => {
                         tracing::error!(agent = %self.agent.name, plugin = plugin.name(), error = %e, "on_final_answer failed");
@@ -773,18 +1079,74 @@ impl ExecutionHooks for Journal {
     }
 }
 
+/// Step IDs of a run's second generation, after an overflow compacted it, so they don't meet the
+/// first one's recorded requests.
+fn generation_prefix(generation: u32) -> String {
+    if generation == 0 {
+        String::new()
+    } else {
+        format!("g{generation}:")
+    }
+}
+/// The head of the summary a new run starts from, compacting first as pi-durable does: over the
+/// blocking threshold the run waits for its summary, and fails if making it fails (one that finds
+/// nothing to compact goes ahead); over the background threshold a summary is made for later runs.
+async fn start_compacted(
+    host: &Arc<Host>,
+    agent: &Arc<Agent>,
+    work: &Work,
+    instructions: &[String],
+) -> Result<Option<i64>, ExecutionError> {
+    let model = &agent.config.models[&agent.config.profiles[&work.profile].model];
+    let history = agent.store.history(work).await.map_err(error)?;
+    let tokens = compaction::context_tokens(instructions, &history);
+    let window = model.context_window.unwrap_or(128_000);
+    match compaction::threshold(tokens, window, &agent.config.durable.compaction) {
+        Some(compaction::Need::Blocking) => {
+            compaction::compact(&host.client, agent, work, "threshold").await?;
+        }
+        Some(compaction::Need::Background) => {
+            compaction::background(host.client.clone(), agent.clone(), work.clone())
+        }
+        None => {}
+    }
+    compaction_head(agent, work).await
+}
+async fn compaction_head(agent: &Agent, work: &Work) -> Result<Option<i64>, ExecutionError> {
+    let (summary, _) = agent
+        .store
+        .compaction_source(&work.scope, &work.session_id)
+        .await
+        .map_err(error)?;
+    Ok(summary.map(|s| s.head))
+}
 async fn run(
     host: Arc<Host>,
     agent: Arc<Agent>,
     work: Work,
     streamed: Arc<Mutex<Streamed>>,
+    generation: u32,
 ) -> Result<TurnResult, ExecutionError> {
     let profile = agent
         .config
         .profiles
         .get(&work.profile)
         .ok_or(ExecutionError::Denied)?;
-    let model = &agent.config.models[&profile.model];
+    let child = match &work.child {
+        Some(spec) => Some(crate::children::ChildRun::of(&agent, profile, spec)?),
+        None => None,
+    };
+    let model_name = child.as_ref().map_or(&profile.model, |c| &c.model).clone();
+    let model = &agent.config.models[&model_name];
+    // A child's event stream never speaks.
+    if profile.speech && child.is_none() {
+        let stored = agent
+            .store
+            .state(&work.scope, &work.session_id)
+            .await
+            .map_err(error)?;
+        agent.hub.speak(&work.session_id, stored.high_water);
+    }
     let session_skills = match agent.turn_pins.get(&work.session_id).await {
         Some(s) => s,
         None => {
@@ -795,22 +1157,58 @@ async fn run(
             }
         }
     };
-    let instructions = agent.render_instructions(&work.profile, &session_skills);
+    let instructions = match &child {
+        Some(c) => agent.render_child_instructions(
+            &work.profile,
+            &session_skills,
+            c.instructions.as_deref(),
+            work.child.as_ref().is_some_and(|s| s.get("task").is_some()),
+        ),
+        None => agent.render_instructions(&work.profile, &session_skills),
+    };
     let spec = ExecutionSpec {
         instructions,
-        model: profile.model.clone(),
+        model: model_name.clone(),
         max_output_tokens: model.max_output_tokens.unwrap_or(4096).min(u32::MAX as u64) as u32,
         max_tool_rounds: agent.config.limits.max_tool_rounds,
         max_parallel_tools: host.config.limits.max_parallel_tools,
     };
-    let history = agent.store.history(&work).await.map_err(error)?;
+    // Which summary the run starts from is a step of its own, so a replay after a restart starts
+    // from the same history even when a newer summary has been placed since.
+    let prefix = generation_prefix(generation);
+    let context_step = Operation {
+        id: format!("{prefix}context"),
+        kind: "context".into(),
+        input: json!({}),
+        unsafe_effect: false,
+        event: None,
+    };
+    let head = match agent
+        .store
+        .prepare(&work, context_step.clone())
+        .await
+        .map_err(error)?
+    {
+        Prepared::Recorded(value) => value["head"].as_i64(),
+        _ => {
+            let head = start_compacted(&host, &agent, &work, &spec.instructions).await?;
+            agent
+                .store
+                .record(&work, &context_step.id, json!({ "head": head }), None)
+                .await
+                .map_err(error)?;
+            head
+        }
+    };
+    let history = agent.store.history_at(&work, head).await.map_err(error)?;
     agent.refresh_tools(&host.client).await;
     let session_tools = agent
         .store
         .get_session_tools(&work.scope, &work.session_id)
         .await
         .unwrap_or_default();
-    let offered_names = if session_tools.offered.is_empty() {
+    // A child's starting set was fixed when it was made; empty means no tools.
+    let offered_names = if session_tools.offered.is_empty() && child.is_none() {
         agent.pinned_tools(&work.scope.tenant_id, profile).await
     } else {
         session_tools.offered
@@ -838,6 +1236,11 @@ async fn run(
         model_index: AtomicUsize::new(0),
         tools,
         streamed,
+        prefix,
+        thinking_level: child
+            .as_ref()
+            .map_or(&profile.thinking_level, |c| &c.thinking_level)
+            .clone(),
     };
     execute_with_hooks(
         &spec,
@@ -850,7 +1253,56 @@ async fn run(
     )
     .await
 }
+/// A run whose request the provider refuses as too long compacts and runs once more, as
+/// pi-durable retries an overflow once after compacting.
+async fn run_compacting(
+    host: Arc<Host>,
+    agent: Arc<Agent>,
+    work: Work,
+    streamed: Arc<Mutex<Streamed>>,
+) -> Result<TurnResult, ExecutionError> {
+    let result = run(
+        host.clone(),
+        agent.clone(),
+        work.clone(),
+        streamed.clone(),
+        0,
+    )
+    .await;
+    match result {
+        Err(ExecutionError::ContextOverflow | ExecutionError::ContextLimit)
+            if agent.config.durable.compaction.enabled =>
+        {
+            let context_step = Operation {
+                id: "context".into(),
+                kind: "context".into(),
+                input: json!({}),
+                unsafe_effect: false,
+                event: None,
+            };
+            let started = match agent
+                .store
+                .prepare(&work, context_step)
+                .await
+                .map_err(error)?
+            {
+                Prepared::Recorded(value) => value["head"].as_i64(),
+                _ => None,
+            };
+            compaction::compact(&host.client, &agent, &work, "overflow").await?;
+            // A background compaction may have placed the summary first; either way the retry
+            // goes ahead only if there is a summary the first generation didn't start from.
+            if compaction_head(&agent, &work).await? != started {
+                run(host, agent, work, streamed, 1).await
+            } else {
+                result
+            }
+        }
+        result => result,
+    }
+}
 async fn process(host: Arc<Host>, agent: Arc<Agent>, work: Work, token: CancellationToken) {
+    let run_started = Instant::now();
     let done = |status: &str, messages: Vec<Message>, error: Option<String>, tokens: (u64, u64)| {
         Completion {
             status: status.into(),
@@ -873,7 +1325,7 @@ async fn process(host: Arc<Host>, agent: Arc<Agent>, work: Work, token: Cancella
     } else {
         let streamed = Arc::new(Mutex::new(Streamed::default()));
         let mut completion = tokio::select! {
-            result = run(host.clone(), agent.clone(), work.clone(), streamed.clone()) => match result {
+            result = run_compacting(host.clone(), agent.clone(), work.clone(), streamed.clone()) => match result {
                 Ok(r) => done("completed", r.messages, None, (r.input_tokens, r.output_tokens)),
                 Err(e) => {
                     tracing::warn!(agent = %agent.name, session_id = %work.session_id, error = ?e, "run failed");
@@ -895,6 +1347,17 @@ async fn process(host: Arc<Host>, agent: Arc<Agent>, work: Work, token: Cancella
         .unwrap_or_default();
     let status = completion.status.clone();
     let reason = completion.error.clone();
+    let metrics = &host.metrics;
+    metrics.add(
+        "agent_ti_runs_total",
+        &[("agent", &agent.name), ("status", &status)],
+        1,
+    );
+    metrics.observe(
+        "agent_ti_run_seconds",
+        &[("agent", &agent.name)],
+        run_started.elapsed(),
+    );
     match agent.store.finish(&work, completion).await {
         Ok(()) => {
             let answered_by = work.reply.as_ref().map_or("model", |r| r.source.as_str());
@@ -910,8 +1373,11 @@ async fn process(host: Arc<Host>, agent: Arc<Agent>, work: Work, token: Cancella
                 reason: reason.as_deref(),
                 text: &text,
             };
-            for plugin in &agent.plugins {
-                plugin.after_run(&info);
+            // As agent-pi, `after_run` is for the user's runs, not a child's.
+            if work.child.is_none() {
+                for plugin in &agent.plugins {
+                    plugin.after_run(&info);
+                }
             }
         }
         Err(e) => {
@@ -931,7 +1397,10 @@ pub async fn schedule(host: Arc<Host>) {
     while host.accepting.load(Ordering::SeqCst) {
         while tasks.try_join_next().is_some() {}
         let mut best: Option<(Arc<Agent>, Candidate, u64)> = None;
-        if host.scheduler.running.lock().unwrap().total < limits.max_concurrent_runs {
+        // Children run outside every run limit, so a parent waiting on its child never holds
+        // the slot the child needs; `maxSubagentsPerSession` bounds them instead.
+        let full = host.scheduler.running.lock().unwrap().total >= limits.max_concurrent_runs;
+        {
             for agent in host.agents.values() {
                 if !agent.accepting.load(Ordering::SeqCst) {
                     continue;
@@ -947,10 +1416,19 @@ pub async fn schedule(host: Arc<Host>) {
                 let r = host.scheduler.running.lock().unwrap();
                 for c in candidates {
                     let user = (agent.name.clone(), c.tenant_id.clone(), c.user_id.clone());
-                    if r.tenants.get(&c.tenant_id).copied().unwrap_or(0)
-                        >= limits.max_concurrent_runs_per_tenant
-                        || r.users.get(&user).copied().unwrap_or(0)
-                            >= agent.config.limits.max_concurrent_runs_per_user
+                    if c.task
+                        && (full
+                            || r.background.get(&user).copied().unwrap_or(0)
+                                >= agent.config.limits.max_background_runs_per_user)
+                    {
+                        continue;
+                    }
+                    if !c.child
+                        && (full
+                            || r.tenants.get(&c.tenant_id).copied().unwrap_or(0)
+                                >= limits.max_concurrent_runs_per_tenant
+                            || r.users.get(&user).copied().unwrap_or(0)
+                                >= agent.config.limits.max_concurrent_runs_per_user)
                     {
                         continue;
                     }
@@ -984,15 +1462,27 @@ pub async fn schedule(host: Arc<Host>) {
         let token = CancellationToken::new();
         {
             let mut r = host.scheduler.running.lock().unwrap();
-            r.total += 1;
-            *r.tenants.entry(work.scope.tenant_id.clone()).or_default() += 1;
-            *r.users
-                .entry((
-                    agent.name.clone(),
-                    work.scope.tenant_id.clone(),
-                    work.scope.user_id.clone(),
-                ))
-                .or_default() += 1;
+            if lease(work.child.as_ref()) == Lease::Background {
+                r.total += 1;
+                *r.background
+                    .entry((
+                        agent.name.clone(),
+                        work.scope.tenant_id.clone(),
+                        work.scope.user_id.clone(),
+                    ))
+                    .or_default() += 1;
+            }
+            if work.child.is_none() {
+                r.total += 1;
+                *r.tenants.entry(work.scope.tenant_id.clone()).or_default() += 1;
+                *r.users
+                    .entry((
+                        agent.name.clone(),
+                        work.scope.tenant_id.clone(),
+                        work.scope.user_id.clone(),
+                    ))
+                    .or_default() += 1;
+            }
             r.tick += 1;
             let tick = r.tick;
             r.served.insert(work.scope.tenant_id.clone(), tick);

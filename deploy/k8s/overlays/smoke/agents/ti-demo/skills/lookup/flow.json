@@ -1,0 +1,46 @@
+{
+  "id": "lookup",
+  "title": "Lookup",
+  "mode": "deterministic",
+  "nodes": [
+    { "id": "start", "kind": "start", "label": "Start" },
+    {
+      "id": "extract",
+      "kind": "extract",
+      "label": "Extract",
+      "extract": {
+        "subject": { "fallbackInput": true },
+        "ambiguous": { "keywords": { "ambiguous": true }, "default": false },
+        "write": { "keywords": { "slowly": true }, "default": false }
+      }
+    },
+    {
+      "id": "check",
+      "kind": "switch",
+      "label": "Check",
+      "branches": [{ "id": "many", "label": "Several", "when": "vars.ambiguous == true", "target": "ask" }],
+      "defaultTarget": "find"
+    },
+    { "id": "ask", "kind": "ask_user", "label": "Ask", "promptTemplate": "Which {{vars.subject}} do you mean?" },
+    { "id": "find", "kind": "tool", "label": "Find", "call": { "tool": "echo", "args": { "value": "$vars.subject" }, "storeAs": "found" } },
+    {
+      "id": "gate",
+      "kind": "switch",
+      "label": "Write?",
+      "branches": [{ "id": "yes", "label": "Write", "when": "vars.write == true", "target": "save" }],
+      "defaultTarget": "reply"
+    },
+    { "id": "save", "kind": "tool", "label": "Save", "call": { "tool": "slow_write", "args": { "value": "$vars.subject" } } },
+    { "id": "reply", "kind": "llm_reply", "label": "Reply" }
+  ],
+  "edges": [
+    { "id": "e1", "source": "start", "target": "extract" },
+    { "id": "e2", "source": "extract", "target": "check" },
+    { "id": "e3", "source": "check", "target": "ask" },
+    { "id": "e4", "source": "check", "target": "find" },
+    { "id": "e5", "source": "find", "target": "gate" },
+    { "id": "e6", "source": "gate", "target": "save" },
+    { "id": "e7", "source": "gate", "target": "reply" },
+    { "id": "e8", "source": "save", "target": "reply" }
+  ]
+}

@@ -87,11 +87,11 @@ Tenant skills and connectors are not config sources. Skills are per-tenant data 
   "limits": {
     "maxBodyBytes": "${MAX_BODY_BYTES:-16000000}",
     "maxConcurrentRuns": "${MAX_RUNS:-200}",
-    "maxConcurrentRunsPerTenant": "${MAX_RUNS_PER_TENANT:-16}",
-    "maxQueuedPerTenant": 128,
+    "maxConcurrentRunsPerTenant": "${MAX_RUNS_PER_TENANT:-100}",
+    "maxQueuedPerTenant": 1024,
     "maxQueuedPerSession": 16,
     "maxSessionsPerTenant": 10000,
-    "maxStreams": 1000,
+    "maxStreams": 2000,
     "maxParallelTools": 4
   },
   "http": { "allowedOrigins": "${ALLOWED_ORIGINS:-}" },
@@ -169,3 +169,25 @@ As with agent-pi:
 - **A new plugin:** Rust code, so a new binary.
 
 Each session records the config version it started under: the agent's `bundle` field, as agent-pi shows in `/v1/runtime`, or else its snapshot's version. A session continues under the config the process has now; agent-pi works the same way.
+
+## Retention and backups
+
+Both are off unless the host file asks, since removing conversations and where copies of them go are the operator's decisions. Every agent in the host follows the same settings.
+
+```json
+{
+  "retention": { "eventsDays": 30, "closedSessionsDays": 90 },
+  "backup": { "dir": "/backups", "intervalMinutes": 60, "keep": 24 }
+}
+```
+
+| Field | Effect |
+| --- | --- |
+| `retention.eventsDays` | A session idle this long loses its events and finished steps. Its transcript stays, and a stream resuming from before them starts with a `snapshot` |
+| `retention.closedSessionsDays` | A session closed and idle this long is removed whole, its children with it |
+| `backup.dir` | Each agent's copies go in `<dir>/<agent>/<millis>.sqlite`. Put it on another volume: a copy on the same volume doesn't survive losing it |
+| `backup.intervalMinutes`, `backup.keep` | How often (default 60), and how many to keep (default 24) |
+
+Retention runs at startup and hourly, and never touches a session with queued or running work. A backup runs at startup and then at each interval. To restore, stop the replica, put the copy in place as `<storage.dir>/<agent>.sqlite`, remove any `-wal` and `-shm` beside it, and start: unfinished work in the copy runs again, as after a crash.
+
+`limits.hookTimeoutMs` (default 10,000) bounds each asynchronous plugin hook. `authenticate`, `before_prompt` and `before_tool_call` refuse when one fails or takes too long; `session_created`, `session_closed` and `after_model_response` are logged and ignored.

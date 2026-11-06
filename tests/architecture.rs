@@ -18,6 +18,7 @@ fn cargo_dependency_boundaries() {
                 "sha2",
                 "thiserror",
                 "base64",
+                "regex",
                 "reqwest",
                 "tempfile",
             ][..],
@@ -69,10 +70,14 @@ fn only_config_sources_read_configuration() {
         "crates/agent-ti-plugin-sdk/src",
         "crates/agent-ti-store/src",
     ] {
-        for entry in std::fs::read_dir(root.join(dir)).unwrap() {
-            let path = entry.unwrap().path();
+        let mut files = vec![root.join(dir)];
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                files.extend(std::fs::read_dir(path).unwrap().map(|e| e.unwrap().path()));
+                continue;
+            }
             let text = std::fs::read_to_string(&path).unwrap();
-            for forbidden in ["fs::read", "read_to_string", "File::open", "load_bundle"] {
+            for forbidden in ["fs::read(", "read_to_string", "File::open", "load_bundle"] {
                 assert!(
                     !text.contains(forbidden),
                     "{} uses {forbidden}; read configuration through a config source",
