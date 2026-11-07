@@ -435,15 +435,19 @@ impl Journal {
                 call_timeout_ms: 30_000,
                 agent_context: false,
             };
-            return adapters::mcp_call(
-                &self.host.client,
-                &srv,
-                &tool.mcp_name,
-                arguments,
-                Some(&grant_token),
-                None,
-            )
-            .await;
+            return adapters::CALL_HEADERS
+                .scope(
+                    self.call_headers(),
+                    adapters::mcp_call(
+                        &self.host.client,
+                        &srv,
+                        &tool.mcp_name,
+                        arguments,
+                        Some(&grant_token),
+                        None,
+                    ),
+                )
+                .await;
         }
         let Some(server) = self.agent.config.mcp_servers.get(tool.server) else {
             return ToolOutcome::error(format!("Tool {} not found", tool.name));
@@ -465,15 +469,29 @@ impl Journal {
         } else {
             None
         };
-        adapters::mcp_call(
-            &self.host.client,
-            server,
-            &tool.mcp_name,
-            arguments,
-            grant_token.as_deref(),
-            meta,
-        )
-        .await
+        adapters::CALL_HEADERS
+            .scope(
+                self.call_headers(),
+                adapters::mcp_call(
+                    &self.host.client,
+                    server,
+                    &tool.mcp_name,
+                    arguments,
+                    grant_token.as_deref(),
+                    meta,
+                ),
+            )
+            .await
+    }
+    fn call_headers(&self) -> Vec<(&'static str, String)> {
+        let mut headers = vec![
+            ("X-Session-ID", self.work.session_id.clone()),
+            ("X-Turn-ID", self.work.turn_id.clone()),
+        ];
+        if let Some(ref trace) = self.work.traceparent {
+            headers.push(("traceparent", trace.clone()));
+        }
+        headers
     }
     async fn grant_token(&self, tool: &str) -> Result<String, ToolOutcome> {
         let Some(ref broker) = self.agent.grants else {

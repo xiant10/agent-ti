@@ -309,6 +309,11 @@ pub struct McpTool {
     pub input_schema: Value,
 }
 /// One JSON-RPC exchange over Streamable HTTP; the response may be JSON or an SSE stream.
+tokio::task_local! {
+    /// What belongs to one tool call: its turn, session and trace, for the tool gateway's spans
+    /// and audit record. A connection may be shared, so it doesn't belong on the client.
+    pub static CALL_HEADERS: Vec<(&'static str, String)>;
+}
 struct McpClient<'a> {
     client: &'a reqwest::Client,
     server: &'a McpServerConfig,
@@ -341,6 +346,11 @@ impl McpClient<'_> {
                 token.to_string()
             };
             r = r.header(header, value);
+            // Only grant servers get these: they're t10's own, and the gateway strips them before
+            // a tenant's server.
+            for (name, value) in CALL_HEADERS.try_with(Clone::clone).unwrap_or_default() {
+                r = r.header(name, value);
+            }
         }
         if let Some(s) = &self.session {
             r = r.header("mcp-session-id", s);
