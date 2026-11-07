@@ -46,7 +46,7 @@
     "gatewayUrl": "${TOOL_GATEWAY_URL:-http://ai-gateway-tools.t10.svc.cluster.local:18095}"
   },
   "mcpServers": [
-    { "name": "property", "transport": "http", "url": "${PROPERTY_MCP_URL:-}", "auth": "grant", "prefix": "", "agentContext": true }
+    { "name": "modules", "transport": "http", "url": "${MODULES_MCP_URL:-}", "auth": "grant", "prefix": "", "agentContext": true }
   ],
   "limits": { "maxSessionsPerUser": 1000, "maxConcurrentRunsPerUser": 20, "maxToolRounds": 12 },
   "durable": { "stream": { "timeoutMs": 120000 } }
