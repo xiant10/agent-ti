@@ -21,6 +21,7 @@ struct AuthState {
     revoked: Arc<Mutex<Vec<String>>>,
     stopped: Arc<Mutex<HashSet<String>>>,
     expired: Arc<Mutex<HashSet<String>>>,
+    ending: Arc<Mutex<HashSet<String>>>,
     mints: Arc<Mutex<usize>>,
     service_mints: Arc<Mutex<usize>>,
     chain_reads: Arc<Mutex<usize>>,
@@ -173,7 +174,23 @@ async fn handle_chain_grant(
             Json(json!({"error": "invalid_grant"})),
         );
     }
-    (StatusCode::OK, Json(json!({"chain": [{"id": id}]})))
+    if state.expired.lock().unwrap().contains(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "grant_expired"})),
+        );
+    }
+    let left = if state.ending.lock().unwrap().contains(&id) {
+        600
+    } else {
+        7200
+    };
+    let ends = jiff::Timestamp::now().as_second() + left;
+    let ends = jiff::Timestamp::from_second(ends).unwrap().to_string();
+    (
+        StatusCode::OK,
+        Json(json!({"chain": [{"id": "grt_parent"}, {"id": id, "expires_at": ends}]})),
+    )
 }
 
 async fn setup_auth_server() -> (String, AuthState) {
@@ -343,6 +360,60 @@ async fn test_grant_broker_full_lifecycle() {
         .await
         .unwrap();
     assert_eq!(child_grant.parent, Some("grt_parent".into()));
+
+    // A later turn keeps a child grant with time left, without trying to extend it
+    let kept = new_broker
+        .attach(&store, &scope, sess_child, &p_delegated, None)
+        .await
+        .unwrap();
+    assert_eq!(kept.grant_id, child_grant.grant_id);
+    assert!(
+        !state
+            .extended
+            .lock()
+            .unwrap()
+            .contains(&child_grant.grant_id)
+    );
+
+    // Close to its end, or past it, a turn opens a new one under the same parent
+    state
+        .ending
+        .lock()
+        .unwrap()
+        .insert(child_grant.grant_id.clone());
+    let near_end = new_broker
+        .attach(&store, &scope, sess_child, &p_delegated, None)
+        .await
+        .unwrap();
+    assert_ne!(near_end.grant_id, child_grant.grant_id);
+    assert_eq!(near_end.parent, Some("grt_parent".into()));
+    state
+        .expired
+        .lock()
+        .unwrap()
+        .insert(near_end.grant_id.clone());
+    let lapsed = new_broker
+        .attach(&store, &scope, sess_child, &p_delegated, None)
+        .await
+        .unwrap();
+    assert_ne!(lapsed.grant_id, near_end.grant_id);
+    new_broker.mint(&lapsed.grant_id).await.unwrap();
+
+    // A stopped one stays stopped
+    state
+        .stopped
+        .lock()
+        .unwrap()
+        .insert(lapsed.grant_id.clone());
+    assert_eq!(
+        new_broker
+            .attach(&store, &scope, sess_child, &p_delegated, None)
+            .await
+            .unwrap_err(),
+        GrantError::Stopped
+    );
+    state.stopped.lock().unwrap().remove(&lapsed.grant_id);
+    *state.chain_reads.lock().unwrap() = 0;
 
     {
         let created = state.created.lock().unwrap();

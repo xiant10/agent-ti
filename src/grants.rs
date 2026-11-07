@@ -13,6 +13,7 @@ use tokio::sync::{Mutex, RwLock};
 
 const RENEW_BEFORE: Duration = Duration::from_secs(60);
 const CHAIN_CACHE_DURATION: Duration = Duration::from_secs(60);
+const DELEGATED_RENEW_WITHIN: Duration = Duration::from_secs(3600);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const ATTEMPTS: usize = 3;
 
@@ -144,11 +145,11 @@ impl GrantBroker {
         if let Some(ref curr) = current
             && curr.parent.as_deref() == parent
         {
-            if parent.is_none() {
-                grant = self.extended(curr, &principal.token, traceparent).await?;
+            grant = if parent.is_none() {
+                self.extended(curr, &principal.token, traceparent).await?
             } else {
-                grant = Some(curr.clone());
-            }
+                self.lasting(curr).await?
+            };
         }
 
         let grant = match grant {
@@ -180,6 +181,51 @@ impl GrantBroker {
             }
             Err(_) => Ok(None),
         }
+    }
+
+    /// A delegated session can't extend its own grant, since only a person's token can. When
+    /// little of it is left, the next turn opens a new one under the same parent, and the old
+    /// one runs out by itself so that work it started isn't cut off.
+    async fn lasting(&self, current: &StoredGrant) -> Result<Option<StoredGrant>, GrantError> {
+        let service = self.service_token().await?;
+        let url = format!(
+            "{}/v1/grants/{}/chain",
+            self.config.url,
+            url_encode(&current.grant_id)
+        );
+        let response = self
+            .client
+            .get(&url)
+            .header("authorization", format!("Bearer {service}"))
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await;
+        // If auth service is temporarily unavailable, keep the current grant.
+        let Ok(response) = response else {
+            return Ok(Some(current.clone()));
+        };
+        let status = response.status();
+        if status.as_u16() >= 500 {
+            return Ok(Some(current.clone()));
+        }
+        let body: Value = response.json().await.unwrap_or(json!({}));
+        if !status.is_success() {
+            return if body["error"] == "grant_expired" {
+                Ok(None)
+            } else {
+                Err(GrantError::Stopped)
+            };
+        }
+        let ends = body["chain"]
+            .as_array()
+            .and_then(|chain| chain.last())
+            .and_then(|leaf| leaf["expires_at"].as_str())
+            .and_then(|at| at.parse::<jiff::Timestamp>().ok());
+        let left = ends.map(|at| at.as_second() - jiff::Timestamp::now().as_second());
+        Ok(match left {
+            Some(left) if left < DELEGATED_RENEW_WITHIN.as_secs() as i64 => None,
+            _ => Some(current.clone()),
+        })
     }
 
     async fn open(
