@@ -1439,6 +1439,7 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/readyz", get(ready))
         .route("/metrics", get(metrics))
         .route("/v1/runtime", get(manifest_default))
+        .route("/agents/{name}/readyz", get(ready))
         .route("/agents/{name}/v1/runtime", get(manifest_named))
         .route(
             "/agent",

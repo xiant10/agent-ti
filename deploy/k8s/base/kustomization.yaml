@@ -8,3 +8,5 @@ configMapGenerator:
     files: [config/agent-ti.json]
   - name: agent-ti-agent-ti
     files: [agents/ti/agent.json, agents/ti/base.md, agents/ti/voice.md]
+  - name: agent-ti-agent-property
+    files: [agents/property/agent.json, agents/property/base.md]

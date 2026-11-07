@@ -73,11 +73,13 @@ spec:
             - {name: data, mountPath: /data}
             - {name: tmp, mountPath: /tmp}
             - {name: agent-ti, mountPath: /etc/agent-ti/agents/ti, readOnly: true}
+            - {name: agent-property, mountPath: /etc/agent-ti/agents/property, readOnly: true}
             - {name: host, mountPath: /etc/agent-ti/host, readOnly: true}
       volumes:
         - {name: tmp, emptyDir: {sizeLimit: 16Mi}}
         - {name: host, configMap: {name: agent-ti-host}}
         - {name: agent-ti, configMap: {name: agent-ti-agent-ti}}
+        - {name: agent-property, configMap: {name: agent-ti-agent-property}}
   volumeClaimTemplates:
     - metadata: {name: data}
       spec:
