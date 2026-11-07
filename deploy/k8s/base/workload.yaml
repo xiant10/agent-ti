@@ -50,6 +50,7 @@ spec:
             - {name: TOOL_GATEWAY_URL, value: "http://ai-gateway-tools.t10.svc.cluster.local:18095"}
             - {name: AGENT_GRANTS_CLIENT_ID, value: "agent-ti"}
             - {name: MODULES_MCP_URL, value: "http://ai-gateway-tools.t10.svc.cluster.local:18095/mcp/modules"}
+            - {name: KNOWLEDGE_MCP_URL, value: "http://ai-gateway-tools.t10.svc.cluster.local:18095/mcp/knowledge"}
             - {name: GRANT_ACTIONS, value: "agent:use,work:read,work:write,knowledge:read,property:read,property:propose"}
             - {name: GRANT_AUDIENCES, value: "agent-ti,t10-collab,t10-knowledge,t10-property,ai-gateway-tools"}
           securityContext:

@@ -53,6 +53,14 @@
       "auth": "grant",
       "prefix": "",
       "agentContext": true
+    },
+    {
+      "name": "knowledge",
+      "transport": "http",
+      "url": "${KNOWLEDGE_MCP_URL:-}",
+      "auth": "grant",
+      "prefix": "",
+      "agentContext": true
     }
   ],
   "limits": {
