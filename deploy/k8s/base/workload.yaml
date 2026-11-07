@@ -49,8 +49,9 @@ spec:
             - {name: AGENT_CONTROL_URL, value: "http://t10-agent-control.t10.svc.cluster.local:18010"}
             - {name: TOOL_GATEWAY_URL, value: "http://ai-gateway-tools.t10.svc.cluster.local:18095"}
             - {name: AGENT_GRANTS_CLIENT_ID, value: "agent-ti"}
-            - {name: GRANT_ACTIONS, value: "agent:use,work:read,work:write,knowledge:read"}
-            - {name: GRANT_AUDIENCES, value: "agent-ti,t10-collab,t10-knowledge,ai-gateway-tools"}
+            - {name: PROPERTY_MCP_URL, value: "http://ai-gateway-tools.t10.svc.cluster.local:18095/mcp/property"}
+            - {name: GRANT_ACTIONS, value: "agent:use,work:read,work:write,knowledge:read,property:read"}
+            - {name: GRANT_AUDIENCES, value: "agent-ti,t10-collab,t10-knowledge,t10-property,ai-gateway-tools"}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
