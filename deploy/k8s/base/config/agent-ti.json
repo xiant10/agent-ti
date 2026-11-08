@@ -18,6 +18,6 @@
     "maxConcurrentRunsPerTenant": "${MAX_RUNS_PER_TENANT:-100}",
     "maxStreams": 2000
   },
-  "agents": "${AGENT_CONFIG:-/etc/agent-ti/agents/ti/agent.json,/etc/agent-ti/agents/property/agent.json}",
-  "defaultAgent": "ti"
+  "agents": "${AGENT_CONFIG:-/etc/agent-ti/agents}",
+  "defaultAgent": "${DEFAULT_AGENT:-}"
 }

@@ -154,6 +154,19 @@ pub(crate) fn cluster_url(url: &str, source: &str, at: &str) -> Result<()> {
     }
 }
 
+/// The `agent.json` of each subfolder of `dir` that has one, in name order.
+fn agents_in(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let file = entry?.path().join("agent.json");
+        if file.is_file() {
+            found.push(file);
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
 /// Reads the host file. Relative paths in it are relative to its directory.
 pub fn load_host(path: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<HostConfig> {
     let source = path.display().to_string();
@@ -324,7 +337,24 @@ pub fn load_host(path: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<Ho
                     name: rest.into(),
                 }
             }
-            _ => AgentLocation::File(dir.join(entry.strip_prefix("file://").unwrap_or(&entry))),
+            _ => {
+                let path = dir.join(entry.strip_prefix("file://").unwrap_or(&entry));
+                if path.is_dir() {
+                    // A folder of agents: each subfolder with an agent.json, by name.
+                    let found = agents_in(&path).map_err(|e| {
+                        ConfigError(format!("{source}: agents {}: {e}", path.display()))
+                    })?;
+                    if found.is_empty() {
+                        return r.fail(
+                            "agents",
+                            &format!("{} has no <agent>/agent.json", path.display()),
+                        );
+                    }
+                    agents.extend(found.into_iter().map(AgentLocation::File));
+                    continue;
+                }
+                AgentLocation::File(path)
+            }
         };
         agents.push(location);
     }

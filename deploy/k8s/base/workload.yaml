@@ -44,15 +44,6 @@ spec:
             # A replica's name, and so its sessions' IDs: agent-ti-0, agent-ti-1, ...
             - name: AGENT_INSTANCE_ID
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
-            # Tenant skills and connectors (step 7), as agent-pi's assistant has them.
-            - {name: AUTH_URL, value: "http://auth-server.t10.svc.cluster.local:18000"}
-            - {name: AGENT_CONTROL_URL, value: "http://t10-agent-control.t10.svc.cluster.local:18010"}
-            - {name: TOOL_GATEWAY_URL, value: "http://ai-gateway-tools.t10.svc.cluster.local:18095"}
-            - {name: AGENT_GRANTS_CLIENT_ID, value: "agent-ti"}
-            - {name: MODULES_MCP_URL, value: "http://ai-gateway-tools.t10.svc.cluster.local:18095/mcp/modules"}
-            - {name: KNOWLEDGE_MCP_URL, value: "http://ai-gateway-tools.t10.svc.cluster.local:18095/mcp/knowledge"}
-            - {name: GRANT_ACTIONS, value: "agent:use,work:read,work:write,knowledge:read,property:read,property:propose"}
-            - {name: GRANT_AUDIENCES, value: "agent-ti,t10-collab,t10-knowledge,t10-property,ai-gateway-tools"}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -73,14 +64,10 @@ spec:
           volumeMounts:
             - {name: data, mountPath: /data}
             - {name: tmp, mountPath: /tmp}
-            - {name: agent-ti, mountPath: /etc/agent-ti/agents/ti, readOnly: true}
-            - {name: agent-property, mountPath: /etc/agent-ti/agents/property, readOnly: true}
             - {name: host, mountPath: /etc/agent-ti/host, readOnly: true}
       volumes:
         - {name: tmp, emptyDir: {sizeLimit: 16Mi}}
         - {name: host, configMap: {name: agent-ti-host}}
-        - {name: agent-ti, configMap: {name: agent-ti-agent-ti}}
-        - {name: agent-property, configMap: {name: agent-ti-agent-property}}
   volumeClaimTemplates:
     - metadata: {name: data}
       spec:

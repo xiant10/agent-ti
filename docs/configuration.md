@@ -98,8 +98,8 @@ Tenant skills and connectors are not config sources. Skills are per-tenant data 
   "sources": {
     "control": { "kind": "http", "url": "${AGENT_CONFIG_API:-}", "tokenEnv": "CONFIG_TOKEN" }
   },
-  "agents": "${AGENT_CONFIG:-agents/ti/agent.json}",
-  "defaultAgent": "ti"
+  "agents": "${AGENT_CONFIG:-/etc/agent-ti/agents}",
+  "defaultAgent": "${DEFAULT_AGENT:-}"
 }
 ```
 
@@ -107,7 +107,7 @@ Tenant skills and connectors are not config sources. Skills are per-tenant data 
 - `limits` are the process's: the body size, runs in the process and per tenant, and the per-tenant and per-session queue, stored sessions per tenant, event streams and parallel tool calls per round. The queue and session limits apply per agent, since each agent has its own store. Sessions and runs per user stay in each `agent.json`, as in agent-pi.
 - `storage.dir` holds one `<agent>.sqlite` per agent ([storage](storage.md#store)) and the config cache.
 - `sources` names remote sources, their base URL and how they authenticate. The local filesystem needs no entry.
-- `agents` is one location or a comma-separated list. A plain path is a local file. `<source>:<name>` reads agent `<name>` from a named source, at `GET <url>/<name>`; for example `control:sales`.
+- `agents` is one location or a comma-separated list. A plain path is a local file, or a folder: each of its subfolders with an `agent.json` is an agent, in name order, and other files are ignored. A folder with none fails startup. `<source>:<name>` reads agent `<name>` from a named source, at `GET <url>/<name>`; for example `control:sales`.
 - `defaultAgent` is the agent served at plain `/agent` and `/v1/runtime` (default: the first agent); every agent is also served at `/agents/{agent}/…`.
 - An unset `instanceId` is generated once and kept in each agent's store, as agent-pi does.
 

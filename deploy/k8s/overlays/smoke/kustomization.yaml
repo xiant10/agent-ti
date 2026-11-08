@@ -6,8 +6,8 @@ configMapGenerator:
   - name: agent-ti-host
     behavior: replace
     files: [agent-ti.json]
-  - name: agent-ti-agent-ti
-    behavior: replace
+  # The test agents, mounted where this host file names them, as any deployment adds its own.
+  - name: agent-ti-agent-ti-demo
     files: [agents/ti-demo/agent.json, agents/ti-demo/base.md, agents/ti-demo/context.md, agents/ti-demo/faq.json, agents/ti-demo/helper.md, guided.md=agents/ti-demo/skills/guided.md, lookup-SKILL.md=agents/ti-demo/skills/lookup/SKILL.md, lookup-flow.json=agents/ti-demo/skills/lookup/flow.json]
   - name: agent-ti-agent-ti-plain
     files: [agents/ti-plain/agent.json, agents/ti-plain/base.md]
@@ -17,22 +17,22 @@ patches:
   - target: {kind: StatefulSet, name: agent-ti}
     patch: |-
       - {op: replace, path: /spec/template/spec/containers/0/envFrom, value: []}
-      - op: replace
-        path: /spec/template/spec/containers/0/volumeMounts/2
-        value: {name: agent-ti, mountPath: /etc/agent-ti/agents/ti-demo, readOnly: true}
       - op: add
         path: /spec/template/spec/containers/0/volumeMounts/-
-        value: {name: agent-ti-plain, mountPath: /etc/agent-ti/agents/ti-plain, readOnly: true}
+        value: {name: ti-demo, mountPath: /etc/agent-ti/agents/ti-demo, readOnly: true}
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts/-
+        value: {name: ti-plain, mountPath: /etc/agent-ti/agents/ti-plain, readOnly: true}
       - op: add
         path: /spec/template/spec/volumes/-
-        value: {name: agent-ti-plain, configMap: {name: agent-ti-agent-ti-plain}}
+        value: {name: ti-plain, configMap: {name: agent-ti-agent-ti-plain}}
       # A ConfigMap key can't hold a slash; `items` gives the skill files their folders.
-      - op: replace
-        path: /spec/template/spec/volumes/2
+      - op: add
+        path: /spec/template/spec/volumes/-
         value:
-          name: agent-ti
+          name: ti-demo
           configMap:
-            name: agent-ti-agent-ti
+            name: agent-ti-agent-ti-demo
             items:
               - {key: agent.json, path: agent.json}
               - {key: base.md, path: base.md}

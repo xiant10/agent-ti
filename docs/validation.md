@@ -40,7 +40,7 @@ These runs predate the switch to agent-pi's design. They don't cover live text, 
 
 ## 2026-11-05: platform picker
 
-Ti Assistant was deployed in the live `t10` namespace as `agent-ti-0` using `t10/agent-ti:picker` ([setup](platform-agent.md)), with real auth-server tokens and the configured LLM gateway.
+Ti Assistant was deployed in the live `t10` namespace as `agent-ti-0` using `t10/agent-ti:picker` ([setup](../../t10-agents/docs/ti.md), then in agent-ti), with real auth-server tokens and the configured LLM gateway.
 
 - The first direct provider reply was `Ti is ready.`.
 - Normal platform drafts published catalog revisions 40–42. The default stayed `assistant` and its three replicas were preserved; re-running registration changed nothing. The gateway's authenticated `agents.list` includes `{name: "ti", title: "Ti Assistant"}`, and Acme, Sample Acme and Sample Globex members can select it.

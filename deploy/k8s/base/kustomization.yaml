@@ -3,10 +3,7 @@ kind: Kustomization
 namespace: t10
 resources: [workload.yaml, networkpolicy.yaml]
 configMapGenerator:
-  # The host file, and one ConfigMap per agent directory, mounted where the host file names them.
+  # The host file, which the image also carries. The runtime has no agents of its own: it
+  # loads each folder in /etc/agent-ti/agents, which whoever deploys it fills, as t10-agents does.
   - name: agent-ti-host
     files: [config/agent-ti.json]
-  - name: agent-ti-agent-ti
-    files: [agents/ti/agent.json, agents/ti/base.md, agents/ti/voice.md]
-  - name: agent-ti-agent-property
-    files: [agents/property/agent.json, agents/property/base.md]

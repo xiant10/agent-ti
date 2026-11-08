@@ -16,6 +16,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && groupadd --gid 10001 agent-ti && useradd --uid 10001 --gid 10001 --no-create-home agent-ti \
     && mkdir -p /data && chown 10001:10001 /data
 COPY --from=build /agent-ti /usr/local/bin/agent-ti
+# The host file every deployment starts from; it takes its settings from the environment
+# and loads each agent folder in /etc/agent-ti/agents, which the image leaves empty.
+COPY deploy/k8s/base/config/agent-ti.json /etc/agent-ti/host/agent-ti.json
 USER 10001:10001
 WORKDIR /opt/agent-ti
 EXPOSE 18120

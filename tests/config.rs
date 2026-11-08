@@ -190,6 +190,37 @@ fn the_host_file_names_agents_and_sources() {
     );
 }
 
+#[test]
+fn a_folder_in_agents_loads_each_agent_in_it_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    for agent in ["ti", "property", "notes"] {
+        std::fs::create_dir_all(dir.path().join("agents").join(agent)).unwrap();
+    }
+    for agent in ["ti", "property"] {
+        std::fs::write(
+            dir.path().join("agents").join(agent).join("agent.json"),
+            MINIMAL,
+        )
+        .unwrap();
+    }
+    std::fs::write(dir.path().join("agents/README.md"), "not an agent").unwrap();
+    let host = host_file(dir.path(), "agents", json!({}));
+    assert_eq!(
+        host.agents,
+        [
+            AgentLocation::File(dir.path().join("agents/property/agent.json")),
+            AgentLocation::File(dir.path().join("agents/ti/agent.json")),
+        ]
+    );
+    std::fs::write(dir.path().join("empty.json"), json!({"auth": {"algorithms": "ES256", "jwksUrl": "http://auth-server:18000/jwks", "issuer": "i", "audience": "a"}, "agents": "agents/notes"}).to_string()).unwrap();
+    assert!(
+        load_host(&dir.path().join("empty.json"), &env(&[]))
+            .unwrap_err()
+            .to_string()
+            .contains("has no <agent>/agent.json")
+    );
+}
+
 async fn serve(documents: Value) -> (String, tokio::task::JoinHandle<()>) {
     use axum::{Router, extract::Path, http::StatusCode, response::IntoResponse, routing::get};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
