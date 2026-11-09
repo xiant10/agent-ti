@@ -297,6 +297,8 @@ async fn summarize(
         ],
         tools: vec![],
         max_output_tokens: max_output.min(u32::MAX as u64) as u32,
+        answer_only: false,
+        force_tool: None,
     };
     let call = adapters::ModelCall {
         config: model,

@@ -7,6 +7,8 @@ use std::{future::Future, pin::Pin};
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Larger tool results go back to the model as an error instead.
 pub const MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
+/// Added to the instructions for the last round, when tools are off.
+pub const LAST_ROUND: &str = "This is the last step for this message, and tools are off. Reply now in text from what the tools returned, and say in one line what you couldn't finish.";
 
 #[derive(Clone, Debug)]
 pub struct ExecutionSpec {
@@ -16,6 +18,13 @@ pub struct ExecutionSpec {
     pub max_tool_rounds: u32,
     /// Independent tool calls of one round run at once, up to this many.
     pub max_parallel_tools: usize,
+    /// Tools that hand work to someone else and leave nothing for the model to say: a round
+    /// whose calls are all these, and all succeed, ends the turn. Any text the model wrote
+    /// with the calls is the reply.
+    pub end_turn_tools: Vec<String>,
+    /// A tool the first model call must call, when it's offered: for work that has to start
+    /// by looking something up.
+    pub first_tool: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
@@ -101,6 +110,13 @@ pub struct ModelRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDescriptor>,
     pub max_output_tokens: u32,
+    /// The model must answer in text. The tools stay listed, since the transcript holds their
+    /// calls, but none may be called.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub answer_only: bool,
+    /// The one tool this call must call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force_tool: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelReply {
@@ -293,12 +309,24 @@ pub async fn execute_with_hooks(
         let budget = context_budget
             .checked_sub(schema_bytes + spec.max_output_tokens as usize)
             .ok_or(ExecutionError::ContextLimit)?;
+        // The last round can't run tools, so the model answers from what it has instead of the
+        // turn failing with nothing to show.
+        let last = round == spec.max_tool_rounds;
+        let mut instructions = spec.instructions.clone();
+        if last && !tools.is_empty() {
+            instructions.push(LAST_ROUND.into());
+        }
         let reply = model
             .generate(ModelRequest {
                 model: spec.model.clone(),
-                messages: context(&spec.instructions, &transcript, budget)?,
+                messages: context(&instructions, &transcript, budget)?,
                 tools: tools.clone(),
                 max_output_tokens: spec.max_output_tokens,
+                answer_only: last && !tools.is_empty(),
+                force_tool: spec
+                    .first_tool
+                    .clone()
+                    .filter(|name| round == 0 && !last && tools.iter().any(|t| &t.name == name)),
             })
             .await?;
         if reply.message.role != "assistant"
@@ -311,10 +339,12 @@ pub async fn execute_with_hooks(
         input_tokens += reply.input_tokens;
         output_tokens += reply.output_tokens;
         let calls = reply.message.tool_calls.clone();
+        let call_names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
+        let said = reply.message.content.clone();
         transcript.push(reply.message);
         if calls.is_empty() {
             if let Some(continuation) = hooks.on_final_answer(transcript.last().unwrap()).await? {
-                if round == spec.max_tool_rounds {
+                if last {
                     return Err(ExecutionError::ToolRoundLimit);
                 }
                 transcript.push(Message::text("user", continuation));
@@ -326,7 +356,7 @@ pub async fn execute_with_hooks(
                 output_tokens,
             });
         }
-        if round == spec.max_tool_rounds {
+        if last {
             return Err(ExecutionError::ToolRoundLimit);
         }
         let mut ids = std::collections::BTreeSet::new();
@@ -355,11 +385,26 @@ pub async fn execute_with_hooks(
             .buffered(spec.max_parallel_tools.max(1))
             .collect()
             .await;
+        let mut handed_over = !spec.end_turn_tools.is_empty()
+            && call_names
+                .iter()
+                .all(|name| spec.end_turn_tools.contains(name));
         for result in results {
             let (id, outcome) = result?;
+            handed_over &= !outcome.is_error;
             transcript.push(Message::tool(&id, outcome));
         }
         let steered = hooks.post_tools().await?;
+        if handed_over && steered.is_empty() {
+            if !said.is_empty() {
+                transcript.push(Message::text("assistant", said));
+            }
+            return Ok(TurnResult {
+                messages: transcript[first..].to_vec(),
+                input_tokens,
+                output_tokens,
+            });
+        }
         for msg in steered {
             transcript.push(msg);
         }

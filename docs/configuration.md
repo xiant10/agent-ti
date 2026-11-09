@@ -154,7 +154,11 @@ Field meanings are agent-pi's (see its [developer guide](../../agent-pi/docs/dev
 | `agent`, `bundle`, `models`, `profiles`, `defaultProfile`, `instructions`, `skillsDir`, `plugins`, `grants`, `mcpServers`, `tenantSkills`, `tenantConnectors`, the other `limits` | agent-pi's meaning |
 | `durable.compaction`, `durable.retry`, `durable.restartLimit`, `durable.stream.timeoutMs` | agent-pi's meaning, applied by agent-ti's own journal and loop |
 | `durable.stream.cacheRetention` | Passed to the provider as its prompt-cache hint |
-| `limits.maxToolRounds` | agent-ti only; agent-pi ignores it |
+| `limits.maxToolRounds` | agent-ti only; agent-pi ignores it. The last round sends the tools with `tool_choice: "none"` and a line asking for an answer, so a turn that runs out of rounds still replies; only a model that calls a tool anyway ends with `ToolRoundLimit` |
+| `profiles.<name>.excludeTools` | agent-ti only: `[server:]glob` patterns a session on this profile is never offered, whatever `alwaysOnTools`, a skill, `search_tools` or preload would switch on. One agent can then keep tools for typed requests out of its conversations |
+| `profiles.<name>.endTurnTools` | agent-ti only: offered tool names that hand work to someone else. A round whose calls are all these, and all succeed, ends the turn without another model call; any text the model wrote with the calls is the reply. Children always answer in text |
+| `profiles.<name>.alwaysOnTools` | agent-pi's meaning, and a session also gets any pinned tool added since it began on its next prompt |
+| `profiles.<name>.firstTool` | agent-ti only: an offered tool name the first model call of each turn must call (`tool_choice` names it), for work that must start by looking something up. A model can still answer without it, so a caller that needs the lookup checks for it |
 | An agent-pi field whose feature isn't ported yet (`subagents`, `progressModel`, `mcpEndpoint`, …) | Accepted with a startup warning naming the missing feature; the feature isn't advertised in `/v1/runtime` |
 | A field agent-pi doesn't know either | Rejected, so a typo stops startup |
 

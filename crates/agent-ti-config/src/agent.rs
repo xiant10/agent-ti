@@ -99,6 +99,12 @@ pub struct ProfileConfig {
     pub thinking_level: String,
     pub instructions: Option<String>,
     pub always_on_tools: Vec<String>,
+    /// Tools this profile is never offered, as `[server:]glob` patterns, whatever else enables them.
+    pub exclude_tools: Vec<String>,
+    /// Offered tool names whose calls end the turn when a round is only these (see agent-ti-core).
+    pub end_turn_tools: Vec<String>,
+    /// An offered tool name the first model call of a turn must call.
+    pub first_tool: Option<String>,
     pub max_active_tools: u64,
     pub preload_max_tools: u64,
     pub preload_min_score: f64,
@@ -282,6 +288,9 @@ const PROFILE: &[&str] = &[
     "thinkingLevel",
     "instructionsFile",
     "alwaysOnTools",
+    "excludeTools",
+    "endTurnTools",
+    "firstTool",
     "maxActiveTools",
     "preload",
     "speech",
@@ -478,6 +487,9 @@ pub fn load_agent(
             )?,
             instructions,
             always_on_tools: r.strings(p.get("alwaysOnTools"), &format!("{at}.alwaysOnTools"))?,
+            exclude_tools: r.strings(p.get("excludeTools"), &format!("{at}.excludeTools"))?,
+            end_turn_tools: r.strings(p.get("endTurnTools"), &format!("{at}.endTurnTools"))?,
+            first_tool: r.optional_string(p.get("firstTool"), &format!("{at}.firstTool"))?,
             max_active_tools: r.count(
                 p.get("maxActiveTools"),
                 &format!("{at}.maxActiveTools"),

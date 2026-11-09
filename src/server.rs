@@ -548,6 +548,22 @@ async fn prompt(
             pinned,
             max_active: prof.max_active_tools as usize,
         };
+        // Pinned tools added to the agent since this session began are offered from its next
+        // turn, so an older conversation doesn't have to search for them.
+        if let Ok(active) = agent.store.get_session_tools(&s, session_id).await {
+            let missing: Vec<String> = policy
+                .pinned
+                .iter()
+                .filter(|name| !active.offered.contains(name))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                let _ = agent
+                    .store
+                    .activate_tools(&s, session_id, &missing, &policy)
+                    .await;
+            }
+        }
         if !plugin_tools.is_empty() {
             let matched = agent.match_tools(&plugin_tools, &s.tenant_id).await;
             if !matched.is_empty() {

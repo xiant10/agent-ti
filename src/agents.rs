@@ -803,13 +803,25 @@ impl Agent {
         tools
     }
 
+    /// The catalog's tools this profile may be offered.
+    async fn profile_tools(
+        &self,
+        tenant: &str,
+        profile: &ProfileConfig,
+    ) -> Vec<crate::catalog::CatalogTool> {
+        let mut tools = self.catalog_tools(tenant).await;
+        tools.retain(|t| allowed(profile, &t.server, &t.mcp_name, &t.name));
+        tools
+    }
+
     pub async fn search_tools(
         &self,
         query: &str,
         limit: usize,
         tenant: &str,
+        profile: &ProfileConfig,
     ) -> Vec<crate::catalog::SearchHit> {
-        let tools = self.catalog_tools(tenant).await;
+        let tools = self.profile_tools(tenant, profile).await;
         let index = crate::catalog::SearchIndex::new(&tools);
         index.search(query, limit)
     }
@@ -823,7 +835,7 @@ impl Agent {
         if profile.preload_max_tools == 0 {
             return Vec::new();
         }
-        let tools = self.catalog_tools(tenant).await;
+        let tools = self.profile_tools(tenant, profile).await;
         let index = crate::catalog::SearchIndex::new(&tools);
         let lowered = input.to_lowercase();
         let mut chosen = Vec::new();
@@ -898,7 +910,7 @@ impl Agent {
     pub async fn offered(
         &self,
         tenant: &str,
-        _profile: &ProfileConfig,
+        profile: &ProfileConfig,
         active_names: &[String],
     ) -> Vec<Arc<OfferedTool>> {
         let mut sets: Vec<Arc<Vec<ToolEntry>>> = Vec::new();
@@ -960,6 +972,15 @@ impl Agent {
         for name in active_names {
             for set in &sets {
                 if let Some(i) = set.iter().position(|t| &t.name == name) {
+                    let t = &set[i];
+                    let server = match (self.config.mcp_servers.get(t.server), &t.connector) {
+                        (Some(server), _) => server.name.as_str(),
+                        (None, Some(connector)) => connector.connector_name.as_str(),
+                        (None, None) => "",
+                    };
+                    if !allowed(profile, server, &t.mcp_name, &t.name) {
+                        break;
+                    }
                     result.push(Arc::new(OfferedTool {
                         set: set.clone(),
                         index: i,
@@ -1061,6 +1082,13 @@ impl Agent {
             });
         }
     }
+}
+/// Whether a profile may be offered a tool: none of its `excludeTools` match it.
+fn allowed(profile: &ProfileConfig, server: &str, mcp_name: &str, name: &str) -> bool {
+    !profile
+        .exclude_tools
+        .iter()
+        .any(|p| crate::catalog::pattern_matches(p, server, mcp_name, name))
 }
 /// One offered tool, keeping its server's listing alive.
 pub struct OfferedTool {

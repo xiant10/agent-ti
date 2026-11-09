@@ -61,6 +61,8 @@ fn spec() -> ExecutionSpec {
         max_output_tokens: 32,
         max_tool_rounds: 2,
         max_parallel_tools: 4,
+        end_turn_tools: vec![],
+        first_tool: None,
     }
 }
 #[tokio::test]
@@ -173,4 +175,172 @@ async fn tool_errors_go_back_to_the_model_and_parallel_results_keep_their_order(
     );
     assert!(tools[2].content.contains("Unknown tool"));
     assert_eq!(result.messages.last().unwrap().content, "corrected");
+}
+struct Recorder(Mutex<Vec<ModelReply>>, Mutex<Vec<ModelRequest>>);
+impl ModelPort for Recorder {
+    fn generate<'a>(
+        &'a self,
+        request: ModelRequest,
+    ) -> BoxFuture<'a, Result<ModelReply, ExecutionError>> {
+        Box::pin(async move {
+            self.1.lock().unwrap().push(request);
+            Ok(self.0.lock().unwrap().remove(0))
+        })
+    }
+}
+#[tokio::test]
+async fn the_last_round_answers_with_tools_off() {
+    let model = Recorder(
+        Mutex::new(vec![
+            reply(calls(vec![call("a", "echo", json!({"v":1}))])),
+            reply(calls(vec![call("b", "echo", json!({"v":2}))])),
+            reply(Message::text("assistant", "what I found")),
+        ]),
+        Mutex::new(vec![]),
+    );
+    let result = execute(
+        &spec(),
+        vec![Message::text("user", "go")],
+        echo(),
+        &model,
+        &Echo,
+        4096,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.messages.last().unwrap().content, "what I found");
+    {
+        let requests = model.1.lock().unwrap();
+        assert_eq!(
+            requests.iter().map(|r| r.answer_only).collect::<Vec<_>>(),
+            [false, false, true]
+        );
+        assert!(requests[2].messages[0].content.ends_with(LAST_ROUND));
+        assert!(!requests[1].messages[0].content.contains(LAST_ROUND));
+    }
+
+    // A model that calls a tool anyway still ends the turn.
+    let model = Recorder(
+        Mutex::new(vec![
+            reply(calls(vec![call("a", "echo", json!({}))])),
+            reply(calls(vec![call("b", "echo", json!({}))])),
+            reply(calls(vec![call("c", "echo", json!({}))])),
+        ]),
+        Mutex::new(vec![]),
+    );
+    let error = execute(
+        &spec(),
+        vec![Message::text("user", "go")],
+        echo(),
+        &model,
+        &Echo,
+        4096,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, ExecutionError::ToolRoundLimit);
+}
+
+#[tokio::test]
+async fn a_round_of_only_handover_tools_ends_the_turn() {
+    let tools = vec![
+        ToolDescriptor {
+            name: "echo".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        },
+        ToolDescriptor {
+            name: "other".into(),
+            description: String::new(),
+            parameters: json!({"type":"object"}),
+        },
+    ];
+    let mut handover = spec();
+    handover.end_turn_tools = vec!["echo".into()];
+    let said = Message {
+        tool_calls: vec![
+            call("a", "echo", json!({"v":1})),
+            call("b", "echo", json!({"v":2})),
+        ],
+        ..Message::text("assistant", "handing it over")
+    };
+    // One model call, then the turn ends with the text written alongside the calls.
+    let model = Recorder(Mutex::new(vec![reply(said)]), Mutex::new(vec![]));
+    let result = execute(
+        &handover,
+        vec![Message::text("user", "go")],
+        tools.clone(),
+        &model,
+        &Echo,
+        4096,
+    )
+    .await
+    .unwrap();
+    assert_eq!(model.1.lock().unwrap().len(), 1);
+    assert_eq!(
+        result
+            .messages
+            .iter()
+            .map(|m| m.role.as_str())
+            .collect::<Vec<_>>(),
+        ["assistant", "tool", "tool", "assistant"]
+    );
+    assert_eq!(result.messages.last().unwrap().content, "handing it over");
+
+    // A failed handover, or a round with another tool in it, goes back to the model.
+    for calls_made in [
+        vec![call("a", "echo", json!({"fail":true}))],
+        vec![call("a", "echo", json!({})), call("b", "other", json!({}))],
+    ] {
+        let model = Recorder(
+            Mutex::new(vec![
+                reply(calls(calls_made)),
+                reply(Message::text("assistant", "done")),
+            ]),
+            Mutex::new(vec![]),
+        );
+        let result = execute(
+            &handover,
+            vec![Message::text("user", "go")],
+            tools.clone(),
+            &model,
+            &Echo,
+            4096,
+        )
+        .await
+        .unwrap();
+        assert_eq!(model.1.lock().unwrap().len(), 2);
+        assert_eq!(result.messages.last().unwrap().content, "done");
+    }
+}
+
+#[tokio::test]
+async fn the_first_tool_is_forced_on_the_first_call_only() {
+    let mut forced = spec();
+    forced.first_tool = Some("echo".into());
+    let model = Recorder(
+        Mutex::new(vec![
+            reply(calls(vec![call("a", "echo", json!({"v":1}))])),
+            reply(Message::text("assistant", "found")),
+        ]),
+        Mutex::new(vec![]),
+    );
+    execute(
+        &forced,
+        vec![Message::text("user", "look it up")],
+        echo(),
+        &model,
+        &Echo,
+        4096,
+    )
+    .await
+    .unwrap();
+    let requests = model.1.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| r.force_tool.clone())
+            .collect::<Vec<_>>(),
+        [Some("echo".to_string()), None]
+    );
 }
