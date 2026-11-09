@@ -300,6 +300,8 @@ async fn test_dynamic_tool_activation_across_rounds() {
         max_output_tokens: 1024,
         max_tool_rounds: 5,
         max_parallel_tools: 1,
+        end_turn_tools: vec![],
+        first_tool: None,
     };
 
     let history = vec![Message::text("user", "Show my accounts")];

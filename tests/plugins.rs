@@ -196,6 +196,8 @@ async fn before_prompt_answers_without_model_and_model_sees_exchange_in_next_tur
         max_output_tokens: 128,
         max_tool_rounds: 2,
         max_parallel_tools: 1,
+        end_turn_tools: vec![],
+        first_tool: None,
     };
     let res = execute(&spec, history, vec![], &script, &MockTools::new(), 4096)
         .await
@@ -694,6 +696,8 @@ async fn model_and_tool_hooks_pipeline() {
         max_output_tokens: 64,
         max_tool_rounds: 5,
         max_parallel_tools: 2,
+        end_turn_tools: vec![],
+        first_tool: None,
     };
 
     let history = vec![Message::text("user", "Do it")];

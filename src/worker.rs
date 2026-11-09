@@ -722,7 +722,12 @@ impl Journal {
 
         let hits = self
             .agent
-            .search_tools(query, limit, &self.work.scope.tenant_id)
+            .search_tools(
+                query,
+                limit,
+                &self.work.scope.tenant_id,
+                &self.agent.config.profiles[&self.work.profile],
+            )
             .await;
         if hits.is_empty() {
             return ToolOutcome::ok("No tools matched. Try other words.");
@@ -1190,6 +1195,17 @@ async fn run(
         max_output_tokens: model.max_output_tokens.unwrap_or(4096).min(u32::MAX as u64) as u32,
         max_tool_rounds: agent.config.limits.max_tool_rounds,
         max_parallel_tools: host.config.limits.max_parallel_tools,
+        // A child works for its parent, so it always answers in text.
+        end_turn_tools: if child.is_some() {
+            vec![]
+        } else {
+            profile.end_turn_tools.clone()
+        },
+        first_tool: if child.is_some() {
+            None
+        } else {
+            profile.first_tool.clone()
+        },
     };
     // Which summary the run starts from is a step of its own, so a replay after a restart starts
     // from the same history even when a newer summary has been placed since.

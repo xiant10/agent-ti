@@ -78,6 +78,11 @@ pub async fn model(
         body["tools"] = Value::Array(
             request.tools.iter().map(|t| json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.parameters}})).collect(),
         );
+        if request.answer_only {
+            body["tool_choice"] = json!("none");
+        } else if let Some(name) = &request.force_tool {
+            body["tool_choice"] = json!({"type":"function","function":{"name":name}});
+        }
     }
     let mut req = client
         .post(format!(

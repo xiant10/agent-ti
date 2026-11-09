@@ -558,3 +558,101 @@ async fn test_mcp_sse_list_changed() {
     assert!(tools.contains(&"collab_query".to_string()));
     assert!(tools.contains(&"collab_update".to_string()));
 }
+
+#[tokio::test]
+async fn a_profile_is_never_offered_its_excluded_tools() {
+    let mcp_state = MockMcpState::default();
+    *mcp_state.tools_list_version.lock().unwrap() = 2;
+    let mcp_app = Router::new()
+        .route("/mcp", post(handle_mcp_post).get(handle_mcp_sse))
+        .with_state(mcp_state.clone());
+    let mcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mcp_port = mcp_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(mcp_listener, mcp_app).await.unwrap();
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent_json = json!({
+        "agent": "ti_exclude_test",
+        "models": {
+            "chat": {
+                "provider": "openai-compatible",
+                "modelId": "m",
+                "baseUrl": "http://127.0.0.1:7200/v1"
+            }
+        },
+        "defaultProfile": "chat",
+        "profiles": {
+            "chat": {
+                "model": "chat",
+                "alwaysOnTools": ["*"],
+                "excludeTools": ["collab:update"]
+            },
+            "typed": {
+                "model": "chat",
+                "alwaysOnTools": ["*"]
+            }
+        },
+        "mcpServers": [
+            {
+                "name": "collab",
+                "transport": "http",
+                "prefix": "collab_",
+                "url": format!("http://127.0.0.1:{mcp_port}/mcp")
+            }
+        ]
+    });
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(agent_dir.join("agent.json"), agent_json.to_string()).unwrap();
+    let host_json = json!({
+        "storage": { "dir": dir.path().join("data") },
+        "auth": {
+            "algorithms": "ES256",
+            "jwksUrl": "http://127.0.0.1:18000/jwks",
+            "issuer": "t10",
+            "audience": "t10",
+            "tenantClaim": "tid"
+        },
+        "agents": agent_dir.join("agent.json").to_str().unwrap()
+    });
+    std::fs::write(dir.path().join("agent-ti.json"), host_json.to_string()).unwrap();
+    let host = agent_ti_config::load_host(
+        &dir.path().join("agent-ti.json"),
+        &agent_ti_config::process_env,
+    )
+    .unwrap();
+    let snapshot = agent_ti_config::FileSource::snapshot(&agent_dir.join("agent.json")).unwrap();
+    let agent = Arc::new(
+        agent_ti::agents::Agent::load(&host, snapshot)
+            .await
+            .unwrap(),
+    );
+    agent.relist_server(0, &reqwest::Client::new()).await;
+
+    let names = |tools: Vec<Arc<agent_ti::agents::OfferedTool>>| {
+        tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>()
+    };
+    let all = vec!["collab_query".to_string(), "collab_update".to_string()];
+    let chat = &agent.config.profiles["chat"];
+    let typed = &agent.config.profiles["typed"];
+    assert_eq!(
+        names(agent.offered("default", chat, &all).await),
+        ["collab_query"]
+    );
+    assert_eq!(names(agent.offered("default", typed, &all).await), all);
+
+    // Searching can't switch an excluded tool on either.
+    let found = |hits: Vec<agent_ti::catalog::SearchHit>| {
+        hits.iter().map(|h| h.tool.name.clone()).collect::<Vec<_>>()
+    };
+    assert!(
+        !found(agent.search_tools("update", 5, "default", chat).await)
+            .contains(&"collab_update".to_string())
+    );
+    assert!(
+        found(agent.search_tools("update", 5, "default", typed).await)
+            .contains(&"collab_update".to_string())
+    );
+}

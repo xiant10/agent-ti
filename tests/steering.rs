@@ -194,6 +194,8 @@ async fn places_a_steer_after_the_current_tool_round() {
         max_output_tokens: 1024,
         max_tool_rounds: 5,
         max_parallel_tools: 1,
+        end_turn_tools: vec![],
+        first_tool: None,
     };
 
     let descriptors = vec![ToolDescriptor {
