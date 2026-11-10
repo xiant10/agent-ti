@@ -823,11 +823,14 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
             let result: Vec<Value> = tools
                 .into_iter()
                 .map(|t| {
+                    // owner is how a tenant's tool list and policy name the tool: the module
+                    // that owns it, or else its server. The harness's own tools have none.
                     json!({
                         "name": t.name,
                         "server": t.server,
                         "tool": t.mcp_name,
                         "description": t.description,
+                        "owner": t.owner,
                     })
                 })
                 .collect();
