@@ -17,6 +17,7 @@ pub struct AgentConfig {
     pub skills: Vec<SkillConfig>,
     pub tenant_skills: Option<TenantSkillsConfig>,
     pub tenant_connectors: Option<TenantConnectorsConfig>,
+    pub tenant_config: Option<TenantConfigSettings>,
     pub mcp_servers: Vec<McpServerConfig>,
     pub grants: Option<GrantsConfig>,
     pub limits: AgentLimits,
@@ -30,6 +31,14 @@ pub struct AgentConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TenantSkillsConfig {
     pub url: String,
+}
+
+/// A tenant's customization of this agent: its instructions, tools, skills and model, read from
+/// t10-agent-control. `keep_tools` are tools a tenant can't turn off, named `owner:tool`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TenantConfigSettings {
+    pub url: String,
+    pub keep_tools: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,6 +153,8 @@ pub struct Section {
     pub name: String,
     pub content: String,
     pub tag: bool,
+    /// Where a tenant's instructions go. It has no text of its own.
+    pub slot: bool,
 }
 #[derive(Clone, Debug)]
 pub struct PluginRef {
@@ -238,6 +249,7 @@ const TOP: &[&str] = &[
     "skillsDir",
     "tenantSkills",
     "tenantConnectors",
+    "tenantConfig",
     "mcpServers",
     "limits",
     "mcpEndpoint",
@@ -359,6 +371,18 @@ fn agent_name(s: &str) -> bool {
 }
 fn section_name(s: &str) -> bool {
     agent_name(s) && !["instructions", "skills", "profile"].contains(&s)
+}
+
+/// A tool named by its owner, `owner:tool`, as t10-agent-control and the tool gateway name it.
+fn owned_tool(s: &str) -> bool {
+    let Some((owner, tool)) = s.split_once(':') else {
+        return false;
+    };
+    agent_name(owner)
+        && !tool.is_empty()
+        && tool
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
 /// Reads the agent file of `snapshot`, and the files it names, through the snapshot.
@@ -591,7 +615,7 @@ pub fn load_agent(
         .enumerate()
     {
         let at = format!("instructions[{index}]");
-        let entry = r.object(value, &at, &["name", "file", "tag"])?;
+        let entry = r.object(value, &at, &["name", "file", "tag", "slot"])?;
         let name = r.string(entry.get("name"), &format!("{at}.name"))?;
         if !section_name(&name) {
             return r.fail(
@@ -599,11 +623,33 @@ pub fn load_agent(
                 "must match ^[a-z][a-z0-9_-]*$ and not be instructions, skills or profile",
             );
         }
+        if r.boolean(entry.get("slot"), &format!("{at}.slot"), false)? {
+            if entry.contains_key("file") {
+                return r.fail(
+                    &format!("{at}.file"),
+                    "a slot has no file: the tenant's text goes there",
+                );
+            }
+            if instructions.iter().any(|s: &Section| s.slot) {
+                return r.fail(
+                    &format!("{at}.slot"),
+                    "only one instruction can be the slot",
+                );
+            }
+            instructions.push(Section {
+                name,
+                content: String::new(),
+                tag: false,
+                slot: true,
+            });
+            continue;
+        }
         let file = r.string(entry.get("file"), &format!("{at}.file"))?;
         instructions.push(Section {
             name,
             content: text(&file, &format!("{at}.file"))?,
             tag: r.boolean(entry.get("tag"), &format!("{at}.tag"), true)?,
+            slot: false,
         });
     }
 
@@ -731,6 +777,35 @@ pub fn load_agent(
         }
     } else {
         None
+    };
+
+    let tenant_config = r.optional_object(
+        top.get("tenantConfig"),
+        "tenantConfig",
+        &["url", "keepTools"],
+    )?;
+    let tenant_config_url = r.optional_string(tenant_config.get("url"), "tenantConfig.url")?;
+    let tenant_config_cfg = match tenant_config_url {
+        Some(url) if !url.is_empty() => {
+            if !grants_on {
+                return r.fail(
+                    "tenantConfig",
+                    "needs a grants section, for the runtime's service account",
+                );
+            }
+            cluster_url(&url, &source, "tenantConfig.url")?;
+            let keep_tools = r.strings(tenant_config.get("keepTools"), "tenantConfig.keepTools")?;
+            for (i, tool) in keep_tools.iter().enumerate() {
+                if !owned_tool(tool) {
+                    return r.fail(
+                        &format!("tenantConfig.keepTools[{i}]"),
+                        "names a tool by its owner, as owner:tool",
+                    );
+                }
+            }
+            Some(TenantConfigSettings { url, keep_tools })
+        }
+        _ => None,
     };
 
     let mut mcp_servers = Vec::new();
@@ -964,6 +1039,7 @@ pub fn load_agent(
         skills,
         tenant_skills: tenant_skills_cfg,
         tenant_connectors: tenant_connectors_cfg,
+        tenant_config: tenant_config_cfg,
         mcp_servers,
         grants: grants_config,
         limits,

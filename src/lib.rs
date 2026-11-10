@@ -15,6 +15,7 @@ pub mod plugins;
 pub mod server;
 pub mod speech;
 pub mod tasks;
+pub mod tenant_config;
 pub mod tenant_connectors;
 pub mod tenant_skills;
 pub mod worker;

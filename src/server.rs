@@ -531,7 +531,34 @@ async fn prompt(
     } else {
         Arc::new(agent.config.skills.clone())
     };
-    agent.turn_pins.pin(session_id, turn_skills.clone()).await;
+    // The tenant's customization for this turn: the session owner's draft in their own test
+    // conversation, or else the published one. It's pinned with the skills, so the whole turn,
+    // and any child it starts, sees one version.
+    let config_draft = session_state
+        .session
+        .metadata
+        .get("configDraft")
+        .and_then(Value::as_bool)
+        == Some(true);
+    let turn_config = match &agent.tenant_config {
+        Some(tc) if config_draft => Some(tc.draft(&s.tenant_id, &s.user_id).await),
+        Some(tc) => Some(tc.for_principal(&s.tenant_id, &s.user_id).await),
+        None => None,
+    };
+    let turn_skills = match &turn_config {
+        Some(c) if !c.skills_off.is_empty() => Arc::new(
+            turn_skills
+                .iter()
+                .filter(|sk| c.skill_on(&sk.name))
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
+        _ => turn_skills,
+    };
+    agent
+        .turn_pins
+        .pin(session_id, turn_skills.clone(), turn_config.clone())
+        .await;
 
     // Someone is here: idle tasks' reply clocks start, and tasks may wake the session again.
     if session_state.session.parent.is_none() && agent.has_background_tasks() {
@@ -574,7 +601,15 @@ async fn prompt(
             }
         }
         if prof.preload_max_tools > 0 {
-            let preloaded = agent.preload_tools(&text, prof, &s.tenant_id).await;
+            let preloaded = agent
+                .preload_tools(
+                    &text,
+                    prof,
+                    &s.tenant_id,
+                    &turn_skills,
+                    turn_config.as_deref(),
+                )
+                .await;
             if !preloaded.is_empty() {
                 let _ = agent
                     .store
@@ -670,11 +705,7 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
     match r.method.as_str() {
         "agents.list" => return ok(r.id, json!({"agents":[{"name":agent.name}]}), None),
         "skills.list" => {
-            let skills_view = if let Some(ref ts) = agent.tenant_skills {
-                ts.for_tenant(Some(&s.tenant_id)).await
-            } else {
-                Arc::new(agent.config.skills.clone())
-            };
+            let skills_view = agent.visible_skills(&s.tenant_id, &s.user_id).await;
             let skills: Vec<Value> = skills_view
                 .iter()
                 .map(|s| {
@@ -703,11 +734,7 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
                 Some(name) if !name.is_empty() => name,
                 _ => return fail(StatusCode::BAD_REQUEST, "skill must be a non-empty string"),
             };
-            let skills_view = if let Some(ref ts) = agent.tenant_skills {
-                ts.for_tenant(Some(&s.tenant_id)).await
-            } else {
-                Arc::new(agent.config.skills.clone())
-            };
+            let skills_view = agent.visible_skills(&s.tenant_id, &s.user_id).await;
             let skill = match skills_view.iter().find(|s| s.name == skill_name) {
                 Some(s) => s,
                 None => {
@@ -845,13 +872,27 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
             }
             let id = format!("{}.{}.{}", agent.name, agent.instance_id, uuid::Uuid::new_v4().simple());
             let key = header(&headers, "agent-request-id").map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            // The tenant's model is recorded with the session, as its profile is, so a later
+            // version doesn't move an existing conversation to another model.
+            let mut origin = p.origin();
+            if let Some(ref tc) = agent.tenant_config {
+                let draft = r.params["metadata"]["configDraft"].as_bool() == Some(true);
+                let config = if draft {
+                    tc.draft(&s.tenant_id, &s.user_id).await
+                } else {
+                    tc.for_principal(&s.tenant_id, &s.user_id).await
+                };
+                if let Some(model) = agent.chosen_model(&agent.config.profiles[&profile], &config) {
+                    origin["model"] = json!(model);
+                }
+            }
             let request = CreateSession {
                 scope: s.clone(),
                 session_id: id,
                 request_key: key,
                 profile,
                 config_version: agent.version.clone(),
-                origin: p.origin(),
+                origin,
                 metadata: r.params.get("metadata").cloned().unwrap_or(json!({})),
                 child: None,
             };
@@ -1431,9 +1472,16 @@ fn manifest(host: Arc<Host>, name: Option<String>, headers: HeaderMap) -> Respon
         Err(e) => return e.into_response(),
     };
     let profiles: Vec<&String> = agent.config.profiles.keys().collect();
+    // An agent that takes a tenant's customization says so, with the model entries a tenant
+    // may pick among, which t10-agent-control checks against what it allows.
+    let mut capabilities: Vec<&str> = CAPABILITIES.to_vec();
+    if agent.tenant_config.is_some() {
+        capabilities.push("tenant_config");
+    }
+    let models: Vec<&String> = agent.config.models.keys().collect();
     Json(json!({
         "contract":0,"harness":"ti","harness_version":env!("CARGO_PKG_VERSION"),"pool":agent.name,"agent":agent.name,
-        "bundle":agent.version,"profiles":profiles,"capabilities":CAPABILITIES,"builtin_tools":[],"methods":[]
+        "bundle":agent.version,"profiles":profiles,"capabilities":capabilities,"models":models,"builtin_tools":[],"methods":[]
     }))
     .into_response()
 }

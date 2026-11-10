@@ -93,6 +93,8 @@ pub struct CatalogTool {
     pub server: String,
     pub mcp_name: String,
     pub description: String,
+    /// The tool's owner as the tool gateway names it (`ToolEntry::owner`).
+    pub owner: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -272,18 +274,21 @@ mod tests {
                 server: "crm".into(),
                 mcp_name: "list_accounts".into(),
                 description: "List customer accounts.".into(),
+                owner: None,
             },
             CatalogTool {
                 name: "crm_get_invoice".into(),
                 server: "crm".into(),
                 mcp_name: "get_invoice".into(),
                 description: "Fetch an invoice with its due date.".into(),
+                owner: None,
             },
             CatalogTool {
                 name: "crm_search_profile".into(),
                 server: "crm".into(),
                 mcp_name: "search_profile".into(),
                 description: "查询客户画像和档案".into(),
+                owner: None,
             },
         ];
 

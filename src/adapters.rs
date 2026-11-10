@@ -312,6 +312,9 @@ pub struct McpTool {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// The module that owns the tool, when the server serves several (the tool gateway's
+    /// `/mcp/modules` puts it in `_meta`, as `t10/module`).
+    pub owner: Option<String>,
 }
 /// One JSON-RPC exchange over Streamable HTTP; the response may be JSON or an SSE stream.
 tokio::task_local! {
@@ -462,6 +465,10 @@ pub async fn mcp_list(
                 } else {
                     json!({"type":"object"})
                 },
+                owner: t["_meta"]["t10/module"]
+                    .as_str()
+                    .filter(|o| !o.is_empty())
+                    .map(str::to_owned),
             });
         }
         cursor = result["nextCursor"].as_str().map(str::to_owned);
