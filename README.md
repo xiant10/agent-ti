@@ -1,10 +1,10 @@
 # agent-ti
 
-agent-pi written in Rust: the runtime and the building blocks an agent is made of, with no agents of its own. It copies agent-pi's protocol, `agent.json` format, plugin hooks, skills and tool loading, grants and voice output, and adds several agents per process and a SQLite journal of its own in place of pi-durable. Where the docs don't say otherwise, agent-pi's behavior is the specification.
+High-performance Rust implementation of the agent-pi harness.
 
-An agent is a folder of config (`agent.json`, its prompts, skills and plugin options). The image's host file loads every agent folder in `/etc/agent-ti/agents`, which a deployment fills. t10's agents, Ti Assistant and the property agent, are in [t10-agents](../t10-agents); a new agent goes there, not here. This repo keeps only the test agents of its smoke overlay and examples.
+## Project Description
 
-**Status:** a durable text agent that passes the shared agent contract and runs an unmodified agent-pi `agent.json` (agent-pi's assistant loads as is), read through config sources: local files or a remote config API. Ti Assistant runs on it in the local platform picker. Live text, steering, skills, grants, tenant skills and connectors, the rest of the plugin hooks and voice are still to port. The [implementation plan](docs/implementation-plan.md) is the one place that tracks what is built.
+**agent-ti** is a high-performance reimplementation of `agent-pi` in Rust. It strictly follows agent-pi's network protocols, `agent.json` schema, plugin hooks, skills architecture, and tool loading conventions, while providing multi-agent per-process concurrency and an internal SQLite write-ahead log journal.
 
 ## Documents
 
