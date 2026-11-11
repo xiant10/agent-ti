@@ -6,6 +6,7 @@ pub mod auth;
 pub mod catalog;
 pub mod children;
 pub mod compaction;
+pub mod control_copy;
 pub mod events;
 pub mod flow;
 pub mod grants;

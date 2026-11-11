@@ -366,25 +366,36 @@ impl Agent {
                 reqwest::Client::new(),
             ))
         });
+        // What control last answered for each tenant is kept beside the agent's store, so a
+        // replica that restarts while control is down starts from it.
+        let control_dir = host.storage_dir.join("control").join(&name);
+        let copies =
+            |feed| crate::control_copy::ControlCopies::new(Some(control_dir.clone()), feed);
         let tenant_skills = if let (Some(ts_cfg), Some(broker)) = (&config.tenant_skills, &grants) {
-            Some(Arc::new(crate::tenant_skills::TenantSkills::new(
-                Arc::new(config.skills.clone()),
-                ts_cfg.url.clone(),
-                broker.clone(),
-                reqwest::Client::new(),
-            )))
+            Some(Arc::new(
+                crate::tenant_skills::TenantSkills::new(
+                    Arc::new(config.skills.clone()),
+                    ts_cfg.url.clone(),
+                    broker.clone(),
+                    reqwest::Client::new(),
+                )
+                .with_copies(copies("skills")),
+            ))
         } else {
             None
         };
         let tenant_connectors = if let (Some(tc_cfg), Some(ts_cfg), Some(broker)) =
             (&config.tenant_connectors, &config.tenant_skills, &grants)
         {
-            Some(Arc::new(crate::tenant_connectors::TenantConnectors::new(
-                ts_cfg.url.clone(),
-                tc_cfg.gateway_url.clone(),
-                broker.clone(),
-                reqwest::Client::new(),
-            )))
+            Some(Arc::new(
+                crate::tenant_connectors::TenantConnectors::new(
+                    ts_cfg.url.clone(),
+                    tc_cfg.gateway_url.clone(),
+                    broker.clone(),
+                    reqwest::Client::new(),
+                )
+                .with_copies(copies("connectors")),
+            ))
         } else {
             None
         };
@@ -400,12 +411,15 @@ impl Agent {
             .await;
         }
         let tenant_config = match (&config.tenant_config, &grants) {
-            (Some(tc), Some(broker)) => Some(Arc::new(crate::tenant_config::TenantConfigs::new(
-                tc.url.clone(),
-                tc.keep_tools.clone(),
-                broker.clone(),
-                reqwest::Client::new(),
-            ))),
+            (Some(tc), Some(broker)) => Some(Arc::new(
+                crate::tenant_config::TenantConfigs::new(
+                    tc.url.clone(),
+                    tc.keep_tools.clone(),
+                    broker.clone(),
+                    reqwest::Client::new(),
+                )
+                .with_copies(copies("config")),
+            )),
             _ => None,
         };
         // Control's change feed is the skills'; a row wakes the tenant's customization too.

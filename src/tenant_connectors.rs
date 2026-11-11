@@ -1,3 +1,4 @@
+use crate::control_copy::ControlCopies;
 use crate::grants::GrantBroker;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -9,7 +10,6 @@ use std::{
 use tokio::sync::{Mutex, RwLock};
 
 const FRESH_DURATION: Duration = Duration::from_secs(10);
-const STALE_DURATION: Duration = Duration::from_secs(300);
 const TIMEOUT_DURATION: Duration = Duration::from_secs(2);
 const MAX_DESCRIPTION: usize = 1000;
 
@@ -53,7 +53,8 @@ pub struct TenantTools {
 struct TenantConnectorsEntry {
     etag: Option<String>,
     tools: TenantTools,
-    ok_at: Instant,
+    /// When control last answered, or `None` if it never has for this tenant.
+    ok_at: Option<Instant>,
     checked_at: Instant,
 }
 
@@ -66,8 +67,8 @@ pub struct TenantConnectors {
     changes: RwLock<HashMap<String, u64>>,
     in_flight: Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
     fresh_duration: Duration,
-    stale_duration: Duration,
     timeout_duration: Duration,
+    copies: ControlCopies,
 }
 
 impl TenantConnectors {
@@ -86,17 +87,38 @@ impl TenantConnectors {
             changes: RwLock::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
             fresh_duration: FRESH_DURATION,
-            stale_duration: STALE_DURATION,
             timeout_duration: TIMEOUT_DURATION,
+            copies: ControlCopies::new(None, "connectors"),
         }
     }
 
-    #[cfg(test)]
-    pub fn with_durations(mut self, fresh: Duration, stale: Duration, timeout: Duration) -> Self {
-        self.fresh_duration = fresh;
-        self.stale_duration = stale;
-        self.timeout_duration = timeout;
+    /// Keeps each tenant's last good answer on disk, so a restart while control is down starts
+    /// from it.
+    pub fn with_copies(mut self, copies: ControlCopies) -> Self {
+        self.copies = copies;
         self
+    }
+
+    /// The copy on disk, the first time this process needs a tenant. Its ETag makes the first
+    /// check a 304 if nothing changed.
+    async fn load_saved(&self, tenant: &str, platform_tool_names: &[String]) {
+        if self.entries.read().await.contains_key(tenant) {
+            return;
+        }
+        let Some(saved) = self.copies.load(tenant) else {
+            return;
+        };
+        let tools = build_tenant_tools(&records_of(&saved.body), platform_tool_names);
+        self.entries
+            .write()
+            .await
+            .entry(tenant.to_string())
+            .or_insert(TenantConnectorsEntry {
+                etag: saved.etag,
+                tools,
+                ok_at: Some(saved.at),
+                checked_at: Instant::now() - self.fresh_duration * 2,
+            });
     }
 
     pub fn gateway_url(&self) -> &str {
@@ -138,6 +160,7 @@ impl TenantConnectors {
         let Some(tenant) = tenant_id.filter(|t| !t.is_empty()) else {
             return TenantTools::default();
         };
+        self.load_saved(tenant, platform_tool_names).await;
 
         {
             let entries = self.entries.read().await;
@@ -204,8 +227,9 @@ impl TenantConnectors {
         let token = match self.broker.service_token().await {
             Ok(tok) => tok,
             Err(e) => {
-                tracing::warn!(tenant = %tenant, error = %e, "connectors.service_token_failed");
-                return self.fallback_or_empty(tenant, existing);
+                return self
+                    .fallback_or_empty(tenant, existing, now, &format!("service token: {e}"))
+                    .await;
             }
         };
 
@@ -225,8 +249,9 @@ impl TenantConnectors {
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(tenant = %tenant, error = %e, "connectors.tenant_unavailable");
-                return self.fallback_or_empty(tenant, existing);
+                return self
+                    .fallback_or_empty(tenant, existing, now, &e.to_string())
+                    .await;
             }
         };
 
@@ -234,7 +259,7 @@ impl TenantConnectors {
         if status == reqwest::StatusCode::NOT_MODIFIED
             && let Some(mut entry) = existing
         {
-            entry.ok_at = now;
+            entry.ok_at = Some(now);
             entry.checked_at = checked_at;
             self.entries
                 .write()
@@ -244,8 +269,9 @@ impl TenantConnectors {
         }
 
         if !status.is_success() {
-            tracing::warn!(tenant = %tenant, status = %status, "connectors.tenant_unavailable");
-            return self.fallback_or_empty(tenant, existing);
+            return self
+                .fallback_or_empty(tenant, existing, now, &format!("status {status}"))
+                .await;
         }
 
         let etag = resp
@@ -257,45 +283,68 @@ impl TenantConnectors {
         let body = match resp.json::<Value>().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(tenant = %tenant, error = %e, "connectors.invalid_json");
-                return self.fallback_or_empty(tenant, existing);
+                return self
+                    .fallback_or_empty(tenant, existing, now, &format!("invalid JSON: {e}"))
+                    .await;
             }
         };
 
-        let records: Vec<TenantConnectorRecord> = body
-            .get("connectors")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| serde_json::from_value::<TenantConnectorRecord>(v.clone()).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let tools = build_tenant_tools(&records, platform_tool_names);
+        let tools = build_tenant_tools(&records_of(&body), platform_tool_names);
+        self.copies.save(tenant, etag.as_deref(), &body);
         let entry = TenantConnectorsEntry {
             etag,
             tools: tools.clone(),
-            ok_at: now,
+            ok_at: Some(now),
             checked_at,
         };
         self.entries.write().await.insert(tenant.to_string(), entry);
         tools
     }
 
-    fn fallback_or_empty(
+    /// The last good answer stands in with no time limit; with none, no connector tools. Either
+    /// way control is asked again only after `fresh_duration`.
+    async fn fallback_or_empty(
         &self,
         tenant: &str,
         existing: Option<TenantConnectorsEntry>,
+        now: Instant,
+        error: &str,
     ) -> TenantTools {
-        if let Some(entry) = existing
-            && entry.ok_at.elapsed() < self.stale_duration
-        {
-            tracing::info!(tenant = %tenant, "using cached connectors during control outage");
-            return entry.tools;
-        }
-        TenantTools::default()
+        let entry = match existing {
+            Some(entry) if entry.ok_at.is_some() => {
+                self.copies
+                    .failed(tenant, error, entry.ok_at, "last answer");
+                TenantConnectorsEntry {
+                    checked_at: now,
+                    ..entry
+                }
+            }
+            _ => {
+                self.copies.failed(tenant, error, None, "none");
+                TenantConnectorsEntry {
+                    etag: None,
+                    tools: TenantTools::default(),
+                    ok_at: None,
+                    checked_at: now,
+                }
+            }
+        };
+        let tools = entry.tools.clone();
+        self.entries.write().await.insert(tenant.to_string(), entry);
+        tools
     }
+}
+
+/// The records in an answer from `GET /v1/runtime/connectors`.
+fn records_of(body: &Value) -> Vec<TenantConnectorRecord> {
+    body.get("connectors")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| serde_json::from_value::<TenantConnectorRecord>(v.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn build_tenant_tools(

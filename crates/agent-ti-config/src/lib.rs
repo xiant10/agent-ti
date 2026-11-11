@@ -12,6 +12,7 @@ use std::{
 use thiserror::Error;
 
 mod agent;
+pub mod control_copy;
 pub mod flow;
 mod host;
 mod http;
