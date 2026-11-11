@@ -699,3 +699,84 @@ async fn test_running_agent_tenant_skills() {
     assert!(updated, "Change feed should invalidate cache and fetch v2");
     let _ = shutdown_tx.send(true);
 }
+
+#[tokio::test]
+async fn test_restart_during_outage_starts_from_the_copy_on_disk() {
+    let control_state = MockControlState::default();
+    control_state.skills.lock().unwrap().insert(
+        "ten_acme".into(),
+        vec![make_override("Acme weather", None, 1)],
+    );
+    let control_app = Router::new()
+        .route("/v1/runtime/skills", get(handle_control_skills))
+        .route(
+            "/v1/token",
+            post(|| async { Json(json!({ "access_token": "service-token", "expires_in": 3600 })) }),
+        )
+        .with_state(control_state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, control_app).await.unwrap();
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let start = || {
+        let broker = Arc::new(agent_ti::grants::GrantBroker::new(
+            GrantsConfig {
+                url: url.clone(),
+                client_id: "agent-ti".into(),
+                client_secret: "secret".into(),
+                actions: vec![],
+                audiences: vec![],
+            },
+            reqwest::Client::new(),
+        ));
+        TenantSkills::new(
+            Arc::new(vec![make_weather_skill()]),
+            url.clone(),
+            broker,
+            reqwest::Client::new(),
+        )
+        .with_copies(agent_ti::control_copy::ControlCopies::new(
+            Some(dir.path().to_path_buf()),
+            "skills",
+        ))
+    };
+    let title = |skills: &[SkillConfig]| {
+        skills[0]
+            .flow
+            .as_ref()
+            .and_then(|f| f["title"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let before = start();
+    assert_eq!(
+        title(&before.for_tenant(Some("ten_acme")).await),
+        "Acme weather"
+    );
+
+    // Control goes down and the replica restarts: it starts from its copy.
+    *control_state.down.lock().unwrap() = true;
+    let after = start();
+    assert_eq!(
+        title(&after.for_tenant(Some("ten_acme")).await),
+        "Acme weather"
+    );
+    // A tenant never read gets the built-in skills.
+    assert_eq!(
+        title(&after.for_tenant(Some("ten_globex")).await),
+        "Weather"
+    );
+
+    // Back up, the first check is conditional on the saved copy.
+    *control_state.down.lock().unwrap() = false;
+    let again = start();
+    assert_eq!(
+        title(&again.for_tenant(Some("ten_acme")).await),
+        "Acme weather"
+    );
+    let calls = control_state.calls.lock().unwrap();
+    assert!(calls.last().unwrap().1.is_some(), "no ETag sent: {calls:?}");
+}

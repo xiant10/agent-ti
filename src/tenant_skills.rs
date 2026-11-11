@@ -1,3 +1,4 @@
+use crate::control_copy::ControlCopies;
 use crate::grants::GrantBroker;
 use agent_ti_config::{SkillConfig, TenantSkillRecord, apply_tenant_skills};
 use serde_json::Value;
@@ -9,7 +10,6 @@ use std::{
 use tokio::sync::{Mutex, RwLock};
 
 const FRESH_DURATION: Duration = Duration::from_secs(10);
-const STALE_DURATION: Duration = Duration::from_secs(300);
 const TIMEOUT_DURATION: Duration = Duration::from_secs(2);
 const RETRY_PAUSE: Duration = Duration::from_secs(5);
 const MAX_TURN_PINS: usize = 10_000;
@@ -19,8 +19,21 @@ struct TenantSkillEntry {
     etag: Option<String>,
     skills: Arc<Vec<SkillConfig>>,
     records: Vec<TenantSkillRecord>,
-    ok_at: Instant,
+    /// When control last answered, or `None` if it never has for this tenant.
+    ok_at: Option<Instant>,
     checked_at: Instant,
+}
+
+/// The records in an answer from `GET /v1/runtime/skills`.
+fn records_of(body: &Value) -> Vec<TenantSkillRecord> {
+    body.get("skills")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| serde_json::from_value::<TenantSkillRecord>(v.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub type TenantChangeListener = Box<dyn Fn(&str) + Send + Sync>;
@@ -35,8 +48,8 @@ pub struct TenantSkills {
     in_flight: Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
     listeners: RwLock<Vec<TenantChangeListener>>,
     fresh_duration: Duration,
-    stale_duration: Duration,
     timeout_duration: Duration,
+    copies: ControlCopies,
 }
 
 impl TenantSkills {
@@ -56,17 +69,49 @@ impl TenantSkills {
             in_flight: Mutex::new(HashMap::new()),
             listeners: RwLock::new(Vec::new()),
             fresh_duration: FRESH_DURATION,
-            stale_duration: STALE_DURATION,
             timeout_duration: TIMEOUT_DURATION,
+            copies: ControlCopies::new(None, "skills"),
         }
     }
 
-    #[cfg(test)]
-    pub fn with_durations(mut self, fresh: Duration, stale: Duration, timeout: Duration) -> Self {
-        self.fresh_duration = fresh;
-        self.stale_duration = stale;
-        self.timeout_duration = timeout;
+    /// Keeps each tenant's last good answer on disk, so a restart while control is down starts
+    /// from it.
+    pub fn with_copies(mut self, copies: ControlCopies) -> Self {
+        self.copies = copies;
         self
+    }
+
+    /// The copy on disk, the first time this process needs a tenant. Its ETag makes the first
+    /// check a 304 if nothing changed.
+    async fn load_saved(&self, tenant: &str) {
+        if self.entries.read().await.contains_key(tenant) {
+            return;
+        }
+        let Some(saved) = self.copies.load(tenant) else {
+            return;
+        };
+        let records = records_of(&saved.body);
+        let skills = self.view(tenant, &records);
+        self.entries
+            .write()
+            .await
+            .entry(tenant.to_string())
+            .or_insert(TenantSkillEntry {
+                etag: saved.etag,
+                skills,
+                records,
+                ok_at: Some(saved.at),
+                checked_at: Instant::now() - self.fresh_duration * 2,
+            });
+    }
+
+    fn view(&self, tenant: &str, records: &[TenantSkillRecord]) -> Arc<Vec<SkillConfig>> {
+        if records.is_empty() {
+            return self.base.clone();
+        }
+        Arc::new(apply_tenant_skills(&self.base, records, |rec, reason| {
+            tracing::warn!(tenant = %tenant, skill = %rec.name, version = rec.version, reason = %reason, "skills.tenant_skipped");
+        }))
     }
 
     pub async fn add_listener(&self, listener: TenantChangeListener) {
@@ -98,6 +143,7 @@ impl TenantSkills {
         let Some(tenant) = tenant_id.filter(|t| !t.is_empty()) else {
             return self.base.clone();
         };
+        self.load_saved(tenant).await;
 
         {
             let entries = self.entries.read().await;
@@ -161,8 +207,9 @@ impl TenantSkills {
         let token = match self.broker.service_token().await {
             Ok(tok) => tok,
             Err(e) => {
-                tracing::warn!(tenant = %tenant, error = %e, "skills.service_token_failed");
-                return self.fallback_or_base(tenant, existing, now);
+                return self
+                    .fallback_or_base(tenant, existing, now, &format!("service token: {e}"))
+                    .await;
             }
         };
 
@@ -182,8 +229,9 @@ impl TenantSkills {
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(tenant = %tenant, error = %e, "skills.tenant_unavailable");
-                return self.fallback_or_base(tenant, existing, now);
+                return self
+                    .fallback_or_base(tenant, existing, now, &e.to_string())
+                    .await;
             }
         };
 
@@ -191,7 +239,7 @@ impl TenantSkills {
         if status == reqwest::StatusCode::NOT_MODIFIED
             && let Some(mut entry) = existing
         {
-            entry.ok_at = now;
+            entry.ok_at = Some(now);
             entry.checked_at = checked_at;
             self.entries
                 .write()
@@ -201,8 +249,9 @@ impl TenantSkills {
         }
 
         if !status.is_success() {
-            tracing::warn!(tenant = %tenant, status = %status, "skills.tenant_unavailable");
-            return self.fallback_or_base(tenant, existing, now);
+            return self
+                .fallback_or_base(tenant, existing, now, &format!("status {status}"))
+                .await;
         }
 
         let etag = resp
@@ -214,54 +263,60 @@ impl TenantSkills {
         let body = match resp.json::<Value>().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(tenant = %tenant, error = %e, "skills.invalid_json");
-                return self.fallback_or_base(tenant, existing, now);
+                return self
+                    .fallback_or_base(tenant, existing, now, &format!("invalid JSON: {e}"))
+                    .await;
             }
         };
 
-        let records: Vec<TenantSkillRecord> = body
-            .get("skills")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| serde_json::from_value::<TenantSkillRecord>(v.clone()).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let skills = if records.is_empty() {
-            self.base.clone()
-        } else {
-            let view = apply_tenant_skills(&self.base, &records, |rec, reason| {
-                tracing::warn!(tenant = %tenant, skill = %rec.name, version = rec.version, reason = %reason, "skills.tenant_skipped");
-            });
-            Arc::new(view)
-        };
+        let records = records_of(&body);
+        let skills = self.view(tenant, &records);
+        self.copies.save(tenant, etag.as_deref(), &body);
 
         let entry = TenantSkillEntry {
             etag,
             skills: skills.clone(),
             records,
-            ok_at: now,
+            ok_at: Some(now),
             checked_at,
         };
         self.entries.write().await.insert(tenant.to_string(), entry);
         skills
     }
 
-    fn fallback_or_base(
+    /// The last good answer stands in with no time limit; with none, the built-in skills. Either
+    /// way control is asked again only after `fresh_duration`, so an outage costs one slow turn
+    /// per tenant, not every one.
+    async fn fallback_or_base(
         &self,
         tenant: &str,
         existing: Option<TenantSkillEntry>,
-        _now: Instant,
+        now: Instant,
+        error: &str,
     ) -> Arc<Vec<SkillConfig>> {
-        if let Some(entry) = existing
-            && entry.ok_at.elapsed() < self.stale_duration
-        {
-            tracing::info!(tenant = %tenant, "using cached skills during control outage");
-            return entry.skills;
-        }
-        self.base.clone()
+        let entry = match existing {
+            Some(entry) if entry.ok_at.is_some() => {
+                self.copies
+                    .failed(tenant, error, entry.ok_at, "last answer");
+                TenantSkillEntry {
+                    checked_at: now,
+                    ..entry
+                }
+            }
+            _ => {
+                self.copies.failed(tenant, error, None, "built-in skills");
+                TenantSkillEntry {
+                    etag: None,
+                    skills: self.base.clone(),
+                    records: Vec::new(),
+                    ok_at: None,
+                    checked_at: now,
+                }
+            }
+        };
+        let skills = entry.skills.clone();
+        self.entries.write().await.insert(tenant.to_string(), entry);
+        skills
     }
 
     /// A tenant's skills with one author's draft of one skill in place of its published version.

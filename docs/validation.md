@@ -209,7 +209,7 @@ The runtime now implements auth grants, offline recovery, MCP grant authenticati
 
 The runtime now implements tenant skills, author drafts, reference files, turn pinning, and tenant connectors:
 - **Tenant Skills & Control integration** (`crates/agent-ti-config` & `src/tenant_skills.rs`):
-  - Fetches tenant skills and workflow overrides from `t10-agent-control` (`GET /v1/runtime/skills?tenant={tenant}`) with ETag caching (10s fresh, 5m stale fallback, 304 Not Modified).
+  - Fetches tenant skills and workflow overrides from `t10-agent-control` (`GET /v1/runtime/skills?tenant={tenant}`) with ETag caching (10s fresh, 304 Not Modified). The last good answer stands in with no time limit and is kept in `storage.dir/control/<agent>/`, as tenant config and connectors are, so a restart while control is down starts from it (`tests/tenant_skills.rs`, `test_restart_during_outage_starts_from_the_copy_on_disk`).
   - Background change feed watcher follows `/v1/runtime/skills/changes?after={cursor}` and invalidates the tenant cache on publication.
   - Author drafts support: test sessions with `session.metadata.skillDraft` resolve draft skill definitions via `/v1/runtime/skills/draft`.
   - Turn pinning (`TurnPins`): skills available at turn start remain pinned in memory for the turn duration, preventing mid-turn skill changes from affecting running turns.

@@ -1,6 +1,7 @@
 //! A tenant's customization of an agent, read from t10-agent-control's `GET /v1/runtime/config`:
 //! its instructions, the tools and skills it turns off, and its model. See
 //! t10-agent-control's docs/tenant-agents.md.
+use crate::control_copy::ControlCopies;
 use crate::grants::GrantBroker;
 use serde_json::Value;
 use std::{
@@ -111,14 +112,16 @@ impl TenantConfig {
 struct Entry {
     etag: Option<String>,
     config: Arc<TenantConfig>,
+    /// When control last answered, or when the copy on disk was saved.
+    ok_at: Instant,
     checked_at: Instant,
 }
 
 /// Each tenant's customization, per principal, because a teammate's account reads its own.
 /// A read is fresh for 10 seconds, and control's change feed (through `TenantSkills`) ends that
 /// early. When control can't be reached, the last good copy stays, with no time limit, because
-/// an older copy of the tenant's choice is better than none. Tool limits don't depend on it:
-/// the tool gateway enforces them.
+/// an older copy of the tenant's choice is better than none, and it's kept on disk so a restart
+/// doesn't lose it. Tool limits don't depend on it: the tool gateway enforces them.
 pub struct TenantConfigs {
     url: String,
     keep: Vec<String>,
@@ -127,6 +130,7 @@ pub struct TenantConfigs {
     entries: RwLock<HashMap<(String, String), Entry>>,
     fresh_duration: Duration,
     timeout_duration: Duration,
+    copies: ControlCopies,
 }
 
 impl TenantConfigs {
@@ -144,7 +148,47 @@ impl TenantConfigs {
             entries: RwLock::new(HashMap::new()),
             fresh_duration: FRESH_DURATION,
             timeout_duration: TIMEOUT_DURATION,
+            copies: ControlCopies::new(None, "config"),
         }
+    }
+
+    /// Keeps each principal's last good answer on disk, so a restart while control is down
+    /// starts from it.
+    pub fn with_copies(mut self, copies: ControlCopies) -> Self {
+        self.copies = copies;
+        self
+    }
+
+    /// The copy on disk, the first time this process needs a principal. Its ETag makes the
+    /// first check a 304 if nothing changed.
+    async fn load_saved(&self, key: &(String, String)) {
+        if self.entries.read().await.contains_key(key) {
+            return;
+        }
+        let Some(saved) = self.copies.load(&copy_key(key)) else {
+            return;
+        };
+        let entry = Entry {
+            etag: saved.etag,
+            config: Arc::new(self.read(&saved.body)),
+            ok_at: saved.at,
+            checked_at: Instant::now() - self.fresh_duration * 2,
+        };
+        self.remember(key.clone(), entry).await;
+    }
+
+    async fn remember(&self, key: (String, String), entry: Entry) {
+        let mut entries = self.entries.write().await;
+        if entries.len() >= MAX_ENTRIES && !entries.contains_key(&key) {
+            let oldest = entries
+                .iter()
+                .min_by_key(|(_, e)| e.checked_at)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                entries.remove(&k);
+            }
+        }
+        entries.entry(key).or_insert(entry);
     }
 
     pub fn shipped(&self) -> Arc<TenantConfig> {
@@ -167,6 +211,7 @@ impl TenantConfigs {
             return self.shipped();
         }
         let key = (tenant.to_owned(), principal.to_owned());
+        self.load_saved(&key).await;
         let etag = {
             let entries = self.entries.read().await;
             match entries.get(&key) {
@@ -181,39 +226,40 @@ impl TenantConfigs {
             Ok(Fetched::Unchanged) => {
                 let mut entries = self.entries.write().await;
                 if let Some(e) = entries.get_mut(&key) {
-                    e.checked_at = Instant::now();
+                    let now = Instant::now();
+                    e.ok_at = now;
+                    e.checked_at = now;
                     return e.config.clone();
                 }
                 self.shipped()
             }
-            Ok(Fetched::New(config, etag)) => {
-                let mut entries = self.entries.write().await;
-                if entries.len() >= MAX_ENTRIES && !entries.contains_key(&key) {
-                    let oldest = entries
-                        .iter()
-                        .min_by_key(|(_, e)| e.checked_at)
-                        .map(|(k, _)| k.clone());
-                    if let Some(k) = oldest {
-                        entries.remove(&k);
-                    }
-                }
-                entries.insert(
+            Ok(Fetched::New(config, etag, body)) => {
+                self.copies.save(&copy_key(&key), etag.as_deref(), &body);
+                let now = Instant::now();
+                self.entries.write().await.remove(&key);
+                self.remember(
                     key,
                     Entry {
                         etag,
                         config: config.clone(),
-                        checked_at: Instant::now(),
+                        ok_at: now,
+                        checked_at: now,
                     },
-                );
+                )
+                .await;
                 config
             }
             Err(e) => {
-                let entries = self.entries.read().await;
-                if let Some(entry) = entries.get(&key) {
-                    tracing::info!(tenant = %tenant, error = %e, "config.using_last_good");
+                let mut entries = self.entries.write().await;
+                if let Some(entry) = entries.get_mut(&key) {
+                    self.copies
+                        .failed(tenant, &e, Some(entry.ok_at), "last answer");
+                    // Asked again only after fresh_duration, so an outage costs one slow turn
+                    // per principal, not every one.
+                    entry.checked_at = Instant::now();
                     return entry.config.clone();
                 }
-                tracing::warn!(tenant = %tenant, error = %e, "config.unavailable: running the agent as shipped");
+                self.copies.failed(tenant, &e, None, "the agent as shipped");
                 self.shipped()
             }
         }
@@ -252,7 +298,7 @@ impl TenantConfigs {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-        Ok(Fetched::New(Arc::new(self.read(&body)), etag))
+        Ok(Fetched::New(Arc::new(self.read(&body)), etag, body))
     }
 
     fn read(&self, body: &Value) -> TenantConfig {
@@ -298,7 +344,13 @@ impl TenantConfigs {
 
 enum Fetched {
     Unchanged,
-    New(Arc<TenantConfig>, Option<String>),
+    /// The customization, its ETag, and the answer as control sent it, which is what's saved.
+    New(Arc<TenantConfig>, Option<String>, Value),
+}
+
+/// A principal's file key, as agent-pi names it.
+fn copy_key(key: &(String, String)) -> String {
+    format!("{}\0{}", key.0, key.1)
 }
 
 #[cfg(test)]
