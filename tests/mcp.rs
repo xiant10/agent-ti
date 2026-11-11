@@ -638,21 +638,28 @@ async fn a_profile_is_never_offered_its_excluded_tools() {
     let chat = &agent.config.profiles["chat"];
     let typed = &agent.config.profiles["typed"];
     assert_eq!(
-        names(agent.offered("default", chat, &all).await),
+        names(agent.offered("default", chat, &all, None).await),
         ["collab_query"]
     );
-    assert_eq!(names(agent.offered("default", typed, &all).await), all);
+    assert_eq!(
+        names(agent.offered("default", typed, &all, None).await),
+        all
+    );
 
     // Searching can't switch an excluded tool on either.
     let found = |hits: Vec<agent_ti::catalog::SearchHit>| {
         hits.iter().map(|h| h.tool.name.clone()).collect::<Vec<_>>()
     };
     assert!(
-        !found(agent.search_tools("update", 5, "default", chat).await)
+        !found(agent.search_tools("update", 5, "default", chat, None).await)
             .contains(&"collab_update".to_string())
     );
     assert!(
-        found(agent.search_tools("update", 5, "default", typed).await)
-            .contains(&"collab_update".to_string())
+        found(
+            agent
+                .search_tools("update", 5, "default", typed, None)
+                .await
+        )
+        .contains(&"collab_update".to_string())
     );
 }

@@ -1,4 +1,5 @@
 //! The agents one process hosts, each loaded from a config source snapshot.
+use crate::tenant_config::TenantConfig;
 use crate::{adapters, plugins};
 use agent_ti_config::{
     AgentConfig, AgentLocation, ConfigSource, FileSource, HostConfig, HttpSource, McpAuth,
@@ -31,6 +32,9 @@ pub struct ToolEntry {
     pub validator: jsonschema::Validator,
     pub handler: Option<agent_ti_plugin_sdk::ToolHandler>,
     pub connector: Option<TenantConnectorTarget>,
+    /// Who owns the tool as the tool gateway names it, which a tenant's tool list matches:
+    /// a module, a server or a connector. `None` for the harness's own tools.
+    pub owner: Option<String>,
 }
 /// A server's listed tools, `None` until a listing succeeds, and when it was last tried.
 type Listing = (Option<Arc<Vec<ToolEntry>>>, Option<Instant>);
@@ -57,6 +61,7 @@ pub struct Agent {
     pub grants: Option<Arc<crate::grants::GrantBroker>>,
     pub tenant_skills: Option<Arc<crate::tenant_skills::TenantSkills>>,
     pub tenant_connectors: Option<Arc<crate::tenant_connectors::TenantConnectors>>,
+    pub tenant_config: Option<Arc<crate::tenant_config::TenantConfigs>>,
     pub turn_pins: Arc<crate::tenant_skills::TurnPins>,
     /// Wakes the background-task supervisor (`tasks::supervise`).
     pub task_wake: tokio::sync::Notify,
@@ -88,6 +93,7 @@ fn child_tool(name: &str, description: &str, param: &str, about: &str) -> ToolEn
         schema,
         handler: None,
         connector: None,
+        owner: None,
     }
 }
 /// A background-task tool with string parameters, and optionally `urgent`.
@@ -113,6 +119,7 @@ fn task_tool(name: &str, description: &str, params: &[(&str, &str)], urgent: boo
         schema,
         handler: None,
         connector: None,
+        owner: None,
     }
 }
 fn meta_tools() -> Vec<ToolEntry> {
@@ -147,6 +154,7 @@ fn meta_tools() -> Vec<ToolEntry> {
             validator: load_skill_validator,
             handler: None,
             connector: None,
+            owner: None,
         },
         ToolEntry {
             name: "search_tools".into(),
@@ -157,6 +165,7 @@ fn meta_tools() -> Vec<ToolEntry> {
             validator: search_tools_validator,
             handler: None,
             connector: None,
+            owner: None,
         },
     ]
 }
@@ -266,6 +275,7 @@ impl Agent {
                     validator,
                     handler: Some(tool.handler),
                     connector: None,
+                    owner: None,
                 });
             }
         }
@@ -389,6 +399,27 @@ impl Agent {
             }))
             .await;
         }
+        let tenant_config = match (&config.tenant_config, &grants) {
+            (Some(tc), Some(broker)) => Some(Arc::new(crate::tenant_config::TenantConfigs::new(
+                tc.url.clone(),
+                tc.keep_tools.clone(),
+                broker.clone(),
+                reqwest::Client::new(),
+            ))),
+            _ => None,
+        };
+        // Control's change feed is the skills'; a row wakes the tenant's customization too.
+        if let (Some(ts), Some(tc)) = (&tenant_skills, &tenant_config) {
+            let tc = tc.clone();
+            ts.add_listener(Box::new(move |tenant: &str| {
+                let tc = tc.clone();
+                let tenant = tenant.to_string();
+                tokio::spawn(async move {
+                    tc.changed(&tenant).await;
+                });
+            }))
+            .await;
+        }
         let turn_pins = Arc::new(crate::tenant_skills::TurnPins::default());
         Ok(Self {
             name,
@@ -407,6 +438,7 @@ impl Agent {
             grants,
             tenant_skills,
             tenant_connectors,
+            tenant_config,
             turn_pins,
             compacting: Default::default(),
             children: Default::default(),
@@ -457,6 +489,7 @@ impl Agent {
                 validator,
                 handler: None,
                 connector: None,
+                owner: Some(tool.owner.unwrap_or_else(|| server.name.clone())),
             });
         }
         entries
@@ -775,6 +808,7 @@ impl Agent {
                             server: server.name.clone(),
                             mcp_name: t.mcp_name.clone(),
                             description: t.description.clone(),
+                            owner: t.owner.clone(),
                         });
                     }
                 }
@@ -785,6 +819,7 @@ impl Agent {
                     server: String::new(),
                     mcp_name: t.mcp_name.clone(),
                     description: t.description.clone(),
+                    owner: None,
                 });
             }
         }
@@ -797,20 +832,25 @@ impl Agent {
                     server: t.server.clone(),
                     mcp_name: t.mcp_name.clone(),
                     description: t.description.clone(),
+                    owner: Some(t.server.clone()),
                 });
             }
         }
         tools
     }
 
-    /// The catalog's tools this profile may be offered.
+    /// The catalog's tools this profile, and the tenant's customization, may be offered.
     async fn profile_tools(
         &self,
         tenant: &str,
         profile: &ProfileConfig,
+        config: Option<&TenantConfig>,
     ) -> Vec<crate::catalog::CatalogTool> {
         let mut tools = self.catalog_tools(tenant).await;
-        tools.retain(|t| allowed(profile, &t.server, &t.mcp_name, &t.name));
+        tools.retain(|t| {
+            allowed(profile, &t.server, &t.mcp_name, &t.name)
+                && config.is_none_or(|c| c.allows(t.owner.as_deref(), &t.mcp_name))
+        });
         tools
     }
 
@@ -820,31 +860,30 @@ impl Agent {
         limit: usize,
         tenant: &str,
         profile: &ProfileConfig,
+        config: Option<&TenantConfig>,
     ) -> Vec<crate::catalog::SearchHit> {
-        let tools = self.profile_tools(tenant, profile).await;
+        let tools = self.profile_tools(tenant, profile, config).await;
         let index = crate::catalog::SearchIndex::new(&tools);
         index.search(query, limit)
     }
 
+    /// Tools to turn on for a turn's input, from the turn's skills and a search. Both are cut
+    /// to what the tenant's customization allows.
     pub async fn preload_tools(
         &self,
         input: &str,
         profile: &ProfileConfig,
         tenant: &str,
+        skills: &[agent_ti_config::SkillConfig],
+        config: Option<&TenantConfig>,
     ) -> Vec<String> {
         if profile.preload_max_tools == 0 {
             return Vec::new();
         }
-        let tools = self.profile_tools(tenant, profile).await;
+        let tools = self.profile_tools(tenant, profile, config).await;
         let index = crate::catalog::SearchIndex::new(&tools);
         let lowered = input.to_lowercase();
         let mut chosen = Vec::new();
-
-        let skills = if let Some(ref ts) = self.tenant_skills {
-            ts.for_tenant(Some(tenant)).await
-        } else {
-            Arc::new(self.config.skills.clone())
-        };
 
         for skill in skills.iter() {
             if skill
@@ -906,12 +945,15 @@ impl Agent {
         chosen
     }
 
-    /// The tools a run of this tenant's session is offered: the session's active tools.
+    /// The tools a run of this tenant's session is offered: the session's active tools, cut to
+    /// what the profile and the tenant's customization allow. A tool a later version turned off
+    /// stays active in the store, and isn't offered.
     pub async fn offered(
         &self,
         tenant: &str,
         profile: &ProfileConfig,
         active_names: &[String],
+        config: Option<&TenantConfig>,
     ) -> Vec<Arc<OfferedTool>> {
         let mut sets: Vec<Arc<Vec<ToolEntry>>> = Vec::new();
         {
@@ -962,6 +1004,7 @@ impl Agent {
                             connector_id: t.connector_id.clone(),
                             connector_name: t.server.clone(),
                         }),
+                        owner: Some(t.server.clone()),
                     });
                 }
                 sets.push(Arc::new(entries));
@@ -978,7 +1021,9 @@ impl Agent {
                         (None, Some(connector)) => connector.connector_name.as_str(),
                         (None, None) => "",
                     };
-                    if !allowed(profile, server, &t.mcp_name, &t.name) {
+                    if !allowed(profile, server, &t.mcp_name, &t.name)
+                        || config.is_some_and(|c| !c.allows(t.owner.as_deref(), &t.mcp_name))
+                    {
                         break;
                     }
                     result.push(Arc::new(OfferedTool {
@@ -992,6 +1037,76 @@ impl Agent {
         result
     }
 
+    /// The customization a turn uses: the one its session's turn pinned, a child session's
+    /// parent's, or else a fresh read. `None` when the agent takes no customization.
+    pub async fn turn_config(
+        &self,
+        session_id: &str,
+        parent: Option<&str>,
+        tenant: &str,
+        principal: &str,
+    ) -> Option<Arc<TenantConfig>> {
+        let configs = self.tenant_config.as_ref()?;
+        if let Some(pinned) = self.turn_pins.config(session_id).await {
+            return Some(pinned);
+        }
+        if let Some(parent) = parent
+            && let Some(pinned) = self.turn_pins.config(parent).await
+        {
+            return Some(pinned);
+        }
+        Some(configs.for_principal(tenant, principal).await)
+    }
+
+    /// The model entry a session runs on: the one recorded when it was created, from the
+    /// tenant's customization, while the agent still has it, or else its profile's.
+    pub fn session_model(&self, profile: &ProfileConfig, origin: &Value) -> String {
+        origin["model"]
+            .as_str()
+            .filter(|m| self.config.models.contains_key(*m))
+            .map_or_else(|| profile.model.clone(), str::to_owned)
+    }
+
+    /// The model a new session on a profile records, from the tenant's customization. A profile
+    /// that speaks keeps its own, fast one. A model entry the agent doesn't have is skipped.
+    pub fn chosen_model(&self, profile: &ProfileConfig, config: &TenantConfig) -> Option<String> {
+        let model = config.model.as_ref()?;
+        if profile.speech {
+            return None;
+        }
+        if !self.config.models.contains_key(model) {
+            tracing::warn!(agent = %self.name, model = %model, version = config.version, "config.unknown_model: the profile's model is used");
+            return None;
+        }
+        Some(model.clone())
+    }
+
+    /// The skills a person sees listed: the tenant's, less those its customization turns off.
+    pub async fn visible_skills(
+        &self,
+        tenant: &str,
+        principal: &str,
+    ) -> Arc<Vec<agent_ti_config::SkillConfig>> {
+        let skills = match &self.tenant_skills {
+            Some(ts) => ts.for_tenant(Some(tenant)).await,
+            None => Arc::new(self.config.skills.clone()),
+        };
+        let Some(ref tc) = self.tenant_config else {
+            return skills;
+        };
+        let config = tc.for_principal(tenant, principal).await;
+        if config.skills_off.is_empty() {
+            return skills;
+        }
+        Arc::new(
+            skills
+                .iter()
+                .filter(|s| config.skill_on(&s.name))
+                .cloned()
+                .collect(),
+        )
+    }
+
     pub fn has_background_tasks(&self) -> bool {
         self.config.subagents.iter().any(|s| s.background)
     }
@@ -1003,8 +1118,9 @@ impl Agent {
         skills: &[agent_ti_config::SkillConfig],
         own: Option<&str>,
         task: bool,
+        tenant: Option<&TenantConfig>,
     ) -> Vec<String> {
-        let mut rendered = self.render_sections(profile_name, skills, false);
+        let mut rendered = self.render_sections(profile_name, skills, false, tenant);
         if task {
             rendered.push(format!(
                 "<tasks>\n{}\n</tasks>",
@@ -1020,25 +1136,39 @@ impl Agent {
         &self,
         profile_name: &str,
         skills: &[agent_ti_config::SkillConfig],
+        tenant: Option<&TenantConfig>,
     ) -> Vec<String> {
-        self.render_sections(profile_name, skills, true)
+        self.render_sections(profile_name, skills, true, tenant)
     }
+    /// The system prompt's sections. A tenant's text goes at the instructions' slot, or after
+    /// the agent's own instructions when there's none, so everything before it stays first.
     fn render_sections(
         &self,
         profile_name: &str,
         skills: &[agent_ti_config::SkillConfig],
         with_profile: bool,
+        tenant: Option<&TenantConfig>,
     ) -> Vec<String> {
         let profile = match self.config.profiles.get(profile_name) {
             Some(p) => p,
             None => return Vec::new(),
         };
-        let mut sections: Vec<(String, String, bool)> = self
-            .config
-            .instructions
-            .iter()
-            .map(|s| (s.name.clone(), s.content.clone(), s.tag))
-            .collect();
+        let tenant_text = tenant.and_then(|t| t.section(profile.speech));
+        let mut sections: Vec<(String, String, bool)> = Vec::new();
+        let mut placed = false;
+        for s in &self.config.instructions {
+            if s.slot {
+                if let Some(text) = &tenant_text {
+                    sections.push((s.name.clone(), text.clone(), false));
+                }
+                placed = true;
+            } else {
+                sections.push((s.name.clone(), s.content.clone(), s.tag));
+            }
+        }
+        if let (false, Some(text)) = (placed, &tenant_text) {
+            sections.push(("tenant".into(), text.clone(), false));
+        }
         if !skills.is_empty() {
             sections.push((
                 "skills".into(),

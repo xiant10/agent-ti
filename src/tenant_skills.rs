@@ -419,32 +419,50 @@ impl TenantSkills {
     }
 }
 
-type PinnedSkills = (Instant, Arc<Vec<SkillConfig>>);
+type PinnedSkills = (
+    Instant,
+    Arc<Vec<SkillConfig>>,
+    Option<Arc<crate::tenant_config::TenantConfig>>,
+);
 
-/// Pins the skills each conversation's turn started with.
+/// Pins the skills, and the tenant's customization, each conversation's turn started with.
 #[derive(Default)]
 pub struct TurnPins {
     pins: Mutex<HashMap<String, PinnedSkills>>,
 }
 
 impl TurnPins {
-    pub async fn pin(&self, session_id: &str, skills: Arc<Vec<SkillConfig>>) {
+    pub async fn pin(
+        &self,
+        session_id: &str,
+        skills: Arc<Vec<SkillConfig>>,
+        config: Option<Arc<crate::tenant_config::TenantConfig>>,
+    ) {
         let mut pins = self.pins.lock().await;
         if pins.len() >= MAX_TURN_PINS {
             let oldest = pins
                 .iter()
-                .min_by_key(|(_, (at, _))| *at)
+                .min_by_key(|(_, (at, _, _))| *at)
                 .map(|(k, _)| k.clone());
             if let Some(k) = oldest {
                 pins.remove(&k);
             }
         }
-        pins.insert(session_id.to_string(), (Instant::now(), skills));
+        pins.insert(session_id.to_string(), (Instant::now(), skills, config));
     }
 
     pub async fn get(&self, session_id: &str) -> Option<Arc<Vec<SkillConfig>>> {
         let pins = self.pins.lock().await;
-        pins.get(session_id).map(|(_, s)| s.clone())
+        pins.get(session_id).map(|(_, s, _)| s.clone())
+    }
+
+    /// The customization a session's turn started with, if it was pinned.
+    pub async fn config(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<crate::tenant_config::TenantConfig>> {
+        let pins = self.pins.lock().await;
+        pins.get(session_id).and_then(|(_, _, c)| c.clone())
     }
 
     pub async fn remove(&self, session_id: &str) {

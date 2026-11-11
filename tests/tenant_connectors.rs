@@ -286,7 +286,7 @@ async fn test_running_agent_tenant_connectors_and_gateway_dispatch() {
     // 6. Test direct dispatch to gateway
     let profile = agent.config.profiles.get("chat").unwrap();
     let acme_offered = agent
-        .offered("ten_acme", profile, &["crm_echo".into()])
+        .offered("ten_acme", profile, &["crm_echo".into()], None)
         .await;
     assert_eq!(acme_offered.len(), 1);
     let tool_echo = &acme_offered[0];
@@ -337,7 +337,7 @@ async fn test_running_agent_tenant_connectors_and_gateway_dispatch() {
 
     // 7. Globex dispatch calls con_b
     let globex_offered = agent
-        .offered("ten_globex", profile, &["crm_whoami".into()])
+        .offered("ten_globex", profile, &["crm_whoami".into()], None)
         .await;
     assert_eq!(globex_offered.len(), 1);
     let target_b = globex_offered[0].connector.as_ref().unwrap();

@@ -232,14 +232,15 @@ async fn test_turn_pins() {
     let weather = make_weather_skill();
     let pins = TurnPins::default();
 
-    pins.pin("sess_1", Arc::new(vec![weather.clone()])).await;
+    pins.pin("sess_1", Arc::new(vec![weather.clone()]), None)
+        .await;
     let read1 = pins.get("sess_1").await.unwrap();
     assert_eq!(read1.len(), 1);
     assert_eq!(read1[0].name, "weather");
 
     let override_rec = make_override("Acme weather v2", Some("crm:get_forecast"), 2);
     let view = apply_tenant_skills(std::slice::from_ref(&weather), &[override_rec], |_, _| {});
-    pins.pin("sess_2", Arc::new(view)).await;
+    pins.pin("sess_2", Arc::new(view), None).await;
 
     // sess_1 still has its pinned skills
     let read1_again = pins.get("sess_1").await.unwrap();
@@ -632,11 +633,11 @@ async fn test_running_agent_tenant_skills() {
     assert_eq!(globex_skills[0].flow.as_ref().unwrap()["title"], "Weather");
 
     // Test instructions rendering
-    let acme_instr = agent.render_instructions("chat", &acme_skills);
+    let acme_instr = agent.render_instructions("chat", &acme_skills, None);
     let acme_instr_str = acme_instr.join("\n");
     assert!(acme_instr_str.contains("- vip-intake: VIP intake"));
 
-    let globex_instr = agent.render_instructions("chat", &globex_skills);
+    let globex_instr = agent.render_instructions("chat", &globex_skills, None);
     let globex_instr_str = globex_instr.join("\n");
     assert!(!globex_instr_str.contains("vip-intake"));
     assert!(globex_instr_str.contains("- weather: Weather forecasts"));
@@ -650,7 +651,9 @@ async fn test_running_agent_tenant_skills() {
         .await;
     assert_eq!(draft_skills.len(), 2);
     assert_eq!(draft_skills[0].description, "VIP intake (draft)");
-    let draft_instr = agent.render_instructions("chat", &draft_skills).join("\n");
+    let draft_instr = agent
+        .render_instructions("chat", &draft_skills, None)
+        .join("\n");
     assert!(draft_instr.contains("- vip-intake: VIP intake (draft)"));
 
     // Test draft author check: bob gets published skill, not ada's draft

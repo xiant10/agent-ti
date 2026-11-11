@@ -162,6 +162,8 @@ struct Journal {
     prefix: String,
     /// The profile's, or a child's own.
     thinking_level: String,
+    /// The tenant's customization this turn pinned, which cuts every tool offered.
+    config: Option<Arc<crate::tenant_config::TenantConfig>>,
 }
 /// The current model message: its ID, and the text streamed of it so far.
 #[derive(Default)]
@@ -571,7 +573,7 @@ impl Journal {
         let found = names.iter().find(|n| *n == name).or(names.first())?.clone();
         let profile = &self.agent.config.profiles[&self.work.profile];
         self.agent
-            .offered(tenant, profile, &[found])
+            .offered(tenant, profile, &[found], self.config.as_deref())
             .await
             .into_iter()
             .next()
@@ -654,9 +656,22 @@ impl Journal {
             .unwrap_or_default();
         *self.tools.write().unwrap() = self
             .agent
-            .offered(&self.work.scope.tenant_id, profile, &active.offered)
+            .offered(
+                &self.work.scope.tenant_id,
+                profile,
+                &active.offered,
+                self.config.as_deref(),
+            )
             .await;
 
+        // A tool the tenant turned off is activated with the skill, and never offered.
+        let matched_names: Vec<String> = {
+            let offered = self.tools.read().unwrap();
+            matched_names
+                .into_iter()
+                .filter(|n| offered.iter().any(|t| &t.name == n))
+                .collect()
+        };
         let footer = if matched_names.is_empty() && !skill.tools.is_empty() {
             "\n\n(The tools this skill uses are unavailable right now; they are enabled automatically once their server connects.)".to_string()
         } else if !matched_names.is_empty() {
@@ -727,6 +742,7 @@ impl Journal {
                 limit,
                 &self.work.scope.tenant_id,
                 &self.agent.config.profiles[&self.work.profile],
+                self.config.as_deref(),
             )
             .await;
         if hits.is_empty() {
@@ -768,7 +784,12 @@ impl Journal {
             .unwrap_or_default();
         *self.tools.write().unwrap() = self
             .agent
-            .offered(&self.work.scope.tenant_id, profile, &active.offered)
+            .offered(
+                &self.work.scope.tenant_id,
+                profile,
+                &active.offered,
+                self.config.as_deref(),
+            )
             .await;
 
         ToolOutcome::ok(reply_text)
@@ -1119,8 +1140,9 @@ async fn start_compacted(
     agent: &Arc<Agent>,
     work: &Work,
     instructions: &[String],
+    model_name: &str,
 ) -> Result<Option<i64>, ExecutionError> {
-    let model = &agent.config.models[&agent.config.profiles[&work.profile].model];
+    let model = &agent.config.models[model_name];
     let history = agent.store.history(work).await.map_err(error)?;
     let tokens = compaction::context_tokens(instructions, &history);
     let window = model.context_window.unwrap_or(128_000);
@@ -1159,17 +1181,28 @@ async fn run(
         Some(spec) => Some(crate::children::ChildRun::of(&agent, profile, spec)?),
         None => None,
     };
-    let model_name = child.as_ref().map_or(&profile.model, |c| &c.model).clone();
+    let stored = agent
+        .store
+        .state(&work.scope, &work.session_id)
+        .await
+        .map_err(error)?;
+    let model_name = match &child {
+        Some(c) => c.model.clone(),
+        None => agent.session_model(profile, &stored.session.origin),
+    };
     let model = &agent.config.models[&model_name];
     // A child's event stream never speaks.
     if profile.speech && child.is_none() {
-        let stored = agent
-            .store
-            .state(&work.scope, &work.session_id)
-            .await
-            .map_err(error)?;
         agent.hub.speak(&work.session_id, stored.high_water);
     }
+    let config = agent
+        .turn_config(
+            &work.session_id,
+            stored.session.parent.as_deref(),
+            &work.scope.tenant_id,
+            &work.scope.user_id,
+        )
+        .await;
     let session_skills = match agent.turn_pins.get(&work.session_id).await {
         Some(s) => s,
         None => {
@@ -1186,8 +1219,9 @@ async fn run(
             &session_skills,
             c.instructions.as_deref(),
             work.child.as_ref().is_some_and(|s| s.get("task").is_some()),
+            config.as_deref(),
         ),
-        None => agent.render_instructions(&work.profile, &session_skills),
+        None => agent.render_instructions(&work.profile, &session_skills, config.as_deref()),
     };
     let spec = ExecutionSpec {
         instructions,
@@ -1225,7 +1259,8 @@ async fn run(
     {
         Prepared::Recorded(value) => value["head"].as_i64(),
         _ => {
-            let head = start_compacted(&host, &agent, &work, &spec.instructions).await?;
+            let head =
+                start_compacted(&host, &agent, &work, &spec.instructions, &model_name).await?;
             agent
                 .store
                 .record(&work, &context_step.id, json!({ "head": head }), None)
@@ -1248,7 +1283,12 @@ async fn run(
         session_tools.offered
     };
     let offered_list = agent
-        .offered(&work.scope.tenant_id, profile, &offered_names)
+        .offered(
+            &work.scope.tenant_id,
+            profile,
+            &offered_names,
+            config.as_deref(),
+        )
         .await;
     let descriptors = offered_list
         .iter()
@@ -1275,6 +1315,7 @@ async fn run(
             .as_ref()
             .map_or(&profile.thinking_level, |c| &c.thinking_level)
             .clone(),
+        config,
     };
     execute_with_hooks(
         &spec,
