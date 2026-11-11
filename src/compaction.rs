@@ -300,11 +300,13 @@ async fn summarize(
         answer_only: false,
         force_tool: None,
     };
+    let run_token = crate::worker::model_token(agent, model, work).await;
     let call = adapters::ModelCall {
         config: model,
         agent: &agent.name,
         thinking_level: &profile.thinking_level,
         timeout: Duration::from_millis(agent.config.durable.stream_timeout_ms),
+        run_token: run_token.as_deref(),
     };
     let reply = adapters::model(client, call, work, request, &mut Silent)
         .await
