@@ -305,11 +305,14 @@ impl ModelPort for Journal {
                 })?;
             }
             let profile = &self.agent.config.profiles[&self.work.profile];
+            let config = &self.agent.config.models[&request.model];
+            let run_token = model_token(&self.agent, config, &self.work).await;
             let call = adapters::ModelCall {
-                config: &self.agent.config.models[&request.model],
+                config,
                 agent: &self.agent.name,
                 thinking_level: &self.thinking_level,
                 timeout: Duration::from_millis(self.agent.config.durable.stream_timeout_ms),
+                run_token: run_token.as_deref(),
             };
             let mut live = LiveText {
                 journal: self,
@@ -1574,4 +1577,20 @@ pub async fn schedule(host: Arc<Host>) {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
     }
+}
+
+/// The run's token for a model call, when the model's identity headers send one.
+pub(crate) async fn model_token(
+    agent: &Agent,
+    config: &agent_ti_config::ModelConfig,
+    work: &Work,
+) -> Option<String> {
+    if !config.identity_headers.contains_key("runToken") {
+        return None;
+    }
+    agent
+        .grants
+        .as_ref()?
+        .model_token(&agent.store, &work.session_id)
+        .await
 }

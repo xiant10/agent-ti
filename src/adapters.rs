@@ -45,6 +45,8 @@ pub struct ModelCall<'a> {
     pub thinking_level: &'a str,
     /// agent-pi's `durable.stream.timeoutMs`: one model request, not the whole run.
     pub timeout: Duration,
+    /// The run's token for the model gateway, sent only where `identityHeaders` names `runToken`.
+    pub run_token: Option<&'a str>,
 }
 /// Text and reasoning as they arrive, in batches.
 pub trait DeltaSink: Send {
@@ -101,6 +103,10 @@ pub async fn model(
             "turnId" => &w.turn_id,
             "userId" => &w.scope.user_id,
             "tenantId" => &w.scope.tenant_id,
+            "runToken" => match call.run_token {
+                Some(token) => token,
+                None => continue,
+            },
             _ => continue,
         };
         req = req.header(header, value);

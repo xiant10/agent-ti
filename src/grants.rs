@@ -316,6 +316,14 @@ impl GrantBroker {
         self.mint(&grant.grant_id).await
     }
 
+    /// The session's token for a model call, when its audience names the model gateway, so
+    /// `ai-gateway-llm` reads the tenant from it. None without a grant, for a grant that doesn't
+    /// list the gateway, or in an outage: the gateway then trusts the tenant header, as before.
+    pub async fn model_token(&self, store: &AgentStore, session_id: &str) -> Option<String> {
+        let token = self.token(store, session_id).await.ok()?;
+        for_model_gateway(&token).then_some(token)
+    }
+
     /// Mints a token for a given `grant_id`.
     pub async fn mint(&self, grant_id: &str) -> Result<String, GrantError> {
         {
@@ -646,5 +654,25 @@ impl GrantBroker {
     /// Closes a session's grant and cleans up cached state.
     pub async fn close(&self, session_id: &str) {
         self.release(session_id).await;
+    }
+}
+
+/// The model gateway's audience. A run's token goes with a model call only when it names this.
+pub const MODEL_AUDIENCE: &str = "ai-gateway-llm";
+
+/// Whether a token is for the model gateway. It reads the claims without checking them: the
+/// gateway does that.
+pub fn for_model_gateway(token: &str) -> bool {
+    use base64::Engine;
+    let Some(payload) = token.split('.').nth(1) else {
+        return false;
+    };
+    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
+        return false;
+    };
+    match serde_json::from_slice::<Value>(&bytes).ok().and_then(|c| c.get("aud").cloned()) {
+        Some(Value::String(aud)) => aud == MODEL_AUDIENCE,
+        Some(Value::Array(aud)) => aud.iter().any(|a| a == MODEL_AUDIENCE),
+        _ => false,
     }
 }

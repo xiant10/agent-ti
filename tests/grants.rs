@@ -504,3 +504,17 @@ async fn test_grant_broker_retries_and_errors() {
     let err2 = broker.token(&store, session_id).await.unwrap_err();
     assert_eq!(err2, GrantError::Expired);
 }
+
+/// A run's token goes with a model call only when it names the model gateway.
+#[test]
+fn model_calls_carry_only_tokens_for_the_model_gateway() {
+    use base64::Engine;
+    let token = |aud: Value| {
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json!({ "aud": aud }).to_string());
+        format!("e30.{claims}.sig")
+    };
+    assert!(for_model_gateway(&token(json!(["ai-gateway-tools", "ai-gateway-llm"]))));
+    assert!(for_model_gateway(&token(json!("ai-gateway-llm"))));
+    assert!(!for_model_gateway(&token(json!(["ai-gateway-tools"]))));
+    assert!(!for_model_gateway("not a token"));
+}

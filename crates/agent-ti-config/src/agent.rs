@@ -352,6 +352,7 @@ const IDENTITY: &[&str] = &[
     "userId",
     "userName",
     "tenantId",
+    "runToken",
 ];
 /// agent-pi's `GATEWAY_IDENTITY_HEADERS`.
 const GATEWAY: &[(&str, &str)] = &[
@@ -361,6 +362,7 @@ const GATEWAY: &[(&str, &str)] = &[
     ("userId", "X-User-Id"),
     ("userName", "X-User-Name"),
     ("tenantId", "X-Tenant-ID"),
+    ("runToken", "X-Run-Token"),
 ];
 
 fn agent_name(s: &str) -> bool {
