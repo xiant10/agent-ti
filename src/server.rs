@@ -367,10 +367,10 @@ fn admitted(a: Admission) -> Value {
     match &a.reply {
         Some(reply) => json!({
             "turnId": a.turn_id, "status": "done", "answeredBy": reply.source, "text": reply.text,
-            "placement": placement, "duplicate": a.duplicate, "submissionId": a.command_id
+            "placement": placement, "duplicate": a.duplicate, "submissionId": a.ordinal
         }),
         None => {
-            json!({"accepted": true, "submissionId": a.command_id, "turnId": a.turn_id, "placement": placement, "duplicate": a.duplicate})
+            json!({"accepted": true, "submissionId": a.ordinal, "turnId": a.turn_id, "placement": placement, "duplicate": a.duplicate})
         }
     }
 }
@@ -1252,11 +1252,16 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
     match result {
         Ok(value) => {
             if wants_stream {
-                let sub_id = value
-                    .get("submissionId")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned);
-                open_event_stream(host.clone(), agent, p, session_id, &headers, sub_id).await
+                let ordinal = value.get("submissionId").and_then(|v| v.as_i64());
+                let sub_id = ordinal.map(|n| n.to_string());
+                // A streamed POST ends with the JSON-RPC response when its submission settles,
+                // as agent-pi's does; a voice client waits for it.
+                let streamed = ordinal.map(|ordinal| Streamed {
+                    rpc_id: r.id.clone(),
+                    turn_id: value["turnId"].as_str().unwrap_or_default().to_owned(),
+                    ordinal,
+                });
+                open_event_stream(host.clone(), agent, p, session_id, &headers, sub_id, streamed).await
             } else {
                 ok(
                     r.id,
@@ -1313,9 +1318,28 @@ async fn events(host: Arc<Host>, name: Option<String>, headers: HeaderMap) -> Re
     let id = header(&headers, "agent-session-id")
         .unwrap_or("")
         .to_owned();
-    open_event_stream(host, agent, p, id, &headers, None).await
+    open_event_stream(host, agent, p, id, &headers, None, None).await
 }
 
+/// The submission a streamed `POST` answers: its JSON-RPC response closes the stream.
+struct Streamed {
+    rpc_id: Value,
+    turn_id: String,
+    ordinal: i64,
+}
+/// The JSON-RPC response that ends a streamed run, shaped like agent-pi's: `done` with the answer's
+/// text, or `unanswered` with a reason.
+fn run_result(streamed: &Streamed, status: &str, text: &str) -> Value {
+    let mut result = json!({"turnId": streamed.turn_id, "submissionId": streamed.ordinal});
+    if status == "completed" {
+        result["status"] = json!("done");
+        result["text"] = json!(text);
+    } else {
+        result["status"] = json!("unanswered");
+        result["reason"] = json!(if status == "cancelled" { "aborted" } else { "error" });
+    }
+    json!({"jsonrpc": "2.0", "id": streamed.rpc_id, "result": result})
+}
 async fn open_event_stream(
     host: Arc<Host>,
     agent: Arc<Agent>,
@@ -1323,6 +1347,7 @@ async fn open_event_stream(
     id: String,
     headers: &HeaderMap,
     submission_id: Option<String>,
+    streamed: Option<Streamed>,
 ) -> Response {
     let s = UserScope {
         tenant_id: p.tenant_id.clone(),
@@ -1422,14 +1447,31 @@ async fn open_event_stream(
                 yield frame(position.render(&id), payload);
             }
         }
+        // A submission that settled before this stream began has no events left to wait for.
+        if let Some(run) = &streamed
+            && let Ok(Some((status, text))) = agent.store.settled(&s, &id, run.ordinal).await
+        {
+            yield Ok::<_, Infallible>(Event::default().data(run_result(run, &status, &text).to_string()));
+            return;
+        }
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 received = rx.recv() => match received {
                     Ok(event) if event.id > last => {
                         last = event.id;
+                        let ours = streamed.as_ref().is_some_and(|run| {
+                            event.payload["type"] == "run.finished" && event.payload["turnId"] == run.turn_id.as_str()
+                        });
                         if let Some(mapped) = map_event((*event.payload).clone()) {
                             yield frame(event.id.render(&id), mapped);
+                        }
+                        if ours
+                            && let Some(run) = &streamed
+                            && let Ok(Some((status, text))) = agent.store.settled(&s, &id, run.ordinal).await
+                        {
+                            yield Ok::<_, Infallible>(Event::default().data(run_result(run, &status, &text).to_string()));
+                            break;
                         }
                     }
                     Ok(_) => {}
@@ -1438,6 +1480,13 @@ async fn open_event_stream(
                 },
                 _ = tick.tick() => {
                     if now() >= p.expires_at || !host.accepting.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    // The run's own event can be missed by a stream that lagged; the store knows.
+                    if let Some(run) = &streamed
+                        && let Ok(Some((status, text))) = agent.store.settled(&s, &id, run.ordinal).await
+                    {
+                        yield Ok::<_, Infallible>(Event::default().data(run_result(run, &status, &text).to_string()));
                         break;
                     }
                 }

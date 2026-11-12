@@ -317,6 +317,34 @@ impl AgentStore {
         }
         Ok(Some((status, answer)))
     }
+    /// How a submission ended, by the number a client was given: its status and the last assistant
+    /// message's text. `None` while it is queued or running.
+    pub async fn settled(
+        &self,
+        s: &UserScope,
+        session_id: &str,
+        ordinal: i64,
+    ) -> StoreResult<Option<(String, String)>> {
+        let mut conn = self.read().await?;
+        let Some(row) = sqlx::query("SELECT command_id,status FROM commands WHERE tenant_id=? AND agent_id=? AND session_id=? AND ordinal=?")
+            .bind(&s.tenant_id).bind(&s.agent_id).bind(session_id).bind(ordinal).fetch_optional(&mut *conn).await.map_err(db)? else {
+            return Ok(None);
+        };
+        let (command, status): (String, String) = (row.get(0), row.get(1));
+        if !matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+            return Ok(None);
+        }
+        let payloads: Vec<String> = sqlx::query_scalar("SELECT payload FROM messages WHERE tenant_id=? AND agent_id=? AND session_id=? AND command_id=? ORDER BY sequence")
+            .bind(&s.tenant_id).bind(&s.agent_id).bind(session_id).bind(&command).fetch_all(&mut *conn).await.map_err(db)?;
+        let mut answer = String::new();
+        for p in payloads {
+            let m: Message = decode(&p)?;
+            if m.role == "assistant" && !m.content.is_empty() {
+                answer = m.content;
+            }
+        }
+        Ok(Some((status, answer)))
+    }
     pub async fn transcript(
         &self,
         s: &UserScope,
@@ -489,7 +517,7 @@ impl AgentStore {
     ) -> StoreResult<Option<Prior>> {
         let mut conn = self.begin().await?;
         owned(&mut conn, s, id).await?;
-        let row = sqlx::query("SELECT command_id,turn_id,fingerprint,reply,source FROM commands WHERE tenant_id=? AND agent_id=? AND session_id=? AND request_key=?")
+        let row = sqlx::query("SELECT command_id,turn_id,fingerprint,reply,source,ordinal FROM commands WHERE tenant_id=? AND agent_id=? AND session_id=? AND request_key=?")
             .bind(&s.tenant_id).bind(&s.agent_id).bind(id).bind(request_key).fetch_optional(&mut *conn).await.map_err(db)?;
         Ok(row.map(|row| {
             let reply = row.get::<Option<String>, _>(3).map(|text| Reply {
@@ -500,6 +528,7 @@ impl AgentStore {
                 fingerprint: row.get(2),
                 admission: Admission {
                     command_id: row.get(0),
+                    ordinal: row.get(5),
                     turn_id: row.get(1),
                     duplicate: true,
                     placed: reply.is_some(),
@@ -522,7 +551,7 @@ impl AgentStore {
         let mut tx = conn.begin_with("BEGIN IMMEDIATE").await.map_err(db)?;
         let mut out = Committed::new();
         let row = owned(&mut tx, &r.scope, &r.session_id).await?;
-        let duplicate = sqlx::query("SELECT command_id,turn_id,fingerprint,reply,source FROM commands WHERE tenant_id=? AND agent_id=? AND session_id=? AND request_key=?")
+        let duplicate = sqlx::query("SELECT command_id,turn_id,fingerprint,reply,source,ordinal FROM commands WHERE tenant_id=? AND agent_id=? AND session_id=? AND request_key=?")
             .bind(&r.scope.tenant_id).bind(&r.scope.agent_id).bind(&r.session_id).bind(&r.request_key).fetch_optional(&mut *tx).await.map_err(db)?;
         if let Some(row) = duplicate {
             if row.get::<String, _>(2) != r.fingerprint {
@@ -534,6 +563,7 @@ impl AgentStore {
             });
             return Ok(Admission {
                 command_id: row.get(0),
+                ordinal: row.get(5),
                 turn_id: row.get(1),
                 duplicate: true,
                 placed: reply.is_some(),
@@ -568,13 +598,13 @@ impl AgentStore {
             Some("reject") => "reject",
             _ => "queue",
         };
-        sqlx::query("INSERT INTO commands(tenant_id,agent_id,session_id,command_id,turn_id,request_key,fingerprint,input,traceparent,reply,source,status,when_busy) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        let ordinal: i64 = sqlx::query_scalar("INSERT INTO commands(tenant_id,agent_id,session_id,command_id,turn_id,request_key,fingerprint,input,traceparent,reply,source,status,when_busy) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING ordinal")
             .bind(&r.scope.tenant_id).bind(&r.scope.agent_id).bind(&r.session_id).bind(&command).bind(&r.turn_id).bind(&r.request_key).bind(&r.fingerprint)
             .bind(&r.input).bind(&r.traceparent).bind(r.reply.as_ref().map(|p| &p.text)).bind(r.reply.as_ref().map(|p| &p.source))
             .bind(if placed { "completed" } else { "queued" })
             .bind(when_busy)
-            .execute(&mut *tx).await.map_err(db)?;
-        event(&mut tx, &mut out,&r.scope,&r.session_id,json!({"type":"submission","submissionId":command,"turnId":r.turn_id,"status":"accepted"})).await?;
+            .fetch_one(&mut *tx).await.map_err(db)?;
+        event(&mut tx, &mut out,&r.scope,&r.session_id,json!({"type":"submission","submissionId":ordinal,"turnId":r.turn_id,"status":"accepted"})).await?;
         if let (true, Some(reply)) = (placed, &r.reply) {
             message(
                 &mut tx,
@@ -605,6 +635,7 @@ impl AgentStore {
         self.publish(out);
         Ok(Admission {
             command_id: command,
+            ordinal,
             turn_id: r.turn_id,
             duplicate: false,
             reply: r.reply,

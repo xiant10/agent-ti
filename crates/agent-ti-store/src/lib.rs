@@ -61,6 +61,8 @@ pub struct SessionState {
 #[derive(Clone, Debug)]
 pub struct Admission {
     pub command_id: String,
+    /// What a client calls the submission: the command's admission order, a number that grows, as in agent-pi.
+    pub ordinal: i64,
     pub turn_id: String,
     pub duplicate: bool,
     /// A plugin's reply, if this input was answered without the model.
