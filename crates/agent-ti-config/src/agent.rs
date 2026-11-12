@@ -216,6 +216,15 @@ pub struct Durable {
     pub cache_retention: Option<String>,
     pub restart_limit: u32,
     pub compaction: Compaction,
+    pub retry: Retry,
+}
+/// pi-durable's retry policy for a model request that failed in a way worth trying again, with
+/// its defaults: 3 retries, 2 s doubling each time, never more than 60 s apart.
+#[derive(Clone, Debug)]
+pub struct Retry {
+    pub max_retries: u32,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
 }
 /// pi-durable's compaction policy, with its defaults. `background_tokens` isn't an `agent.json`
 /// field in agent-pi either.
@@ -1006,9 +1015,15 @@ pub fn load_agent(
         "durable.retry",
         &["maxRetries", "baseDelayMs"],
     )?;
-    if !retry.is_empty() {
-        note("durable.retry", "model request retries");
-    }
+    let retry = Retry {
+        max_retries: r
+            .count(retry.get("maxRetries"), "durable.retry.maxRetries", 3)?
+            .min(10) as u32,
+        base_delay_ms: r
+            .count(retry.get("baseDelayMs"), "durable.retry.baseDelayMs", 2_000)?
+            .min(60_000),
+        max_delay_ms: 60_000,
+    };
     let cache_retention = match stream.get("cacheRetention") {
         None => None,
         value => Some(r.one_of(
@@ -1027,6 +1042,7 @@ pub fn load_agent(
             .count(d.get("restartLimit"), "durable.restartLimit", 5)?
             .max(1) as u32,
         compaction,
+        retry,
     };
     let bundle = r.optional_string(top.get("bundle"), "bundle")?;
     Ok(AgentConfig {

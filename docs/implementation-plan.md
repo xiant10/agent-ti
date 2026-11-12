@@ -36,7 +36,7 @@ Where today's code falls short of, or departs from, the design. Each is closed b
 | Flows: the `flow-runner` plugin | Not ported, so an agent that names it stops at startup. From config it does nothing in agent-pi either (it needs `callTool` from code), and no app uses it | When an agent needs one |
 | Sub-agents and tasks | A parent's tool polls the child's outcome (20–250 ms) rather than being woken | When it shows up in a measurement |
 | Throughput per store | Commits go through one writer, about 100 turns a second on the test machine; agent-ti's own turn time stays flat while runs wait to be claimed | Batching commits, if an agent needs more than a replica gives |
-| `durable.retry`, `cacheRetention`, `progressModel`, `mcpEndpoint`, stdio MCP servers | Accepted in `agent.json` with a startup warning, and not used | When an agent needs one |
+| `cacheRetention`, `progressModel`, `mcpEndpoint`, stdio MCP servers | Accepted in `agent.json` with a startup warning, and not used | When an agent needs one |
 | Models | `openai-compatible` with `chat-completions` only; another provider or `api: "responses"` stops startup | When an agent needs one |
 
 Measured with `t10-perf` ([results](validation.md#2026-11-05-step-12-operations)), and host-file settings (`limits`): 200 concurrent runs per process, 100 per tenant, queued work 1,024 per tenant and 16 per session per agent, 2,000 event streams. Still starting values, not measured: stored sessions 10,000 per tenant per agent, and four parallel tool calls per round. Sessions per user and runs per user come from each `agent.json`, as in agent-pi.

@@ -307,6 +307,7 @@ async fn summarize(
         thinking_level: &profile.thinking_level,
         timeout: Duration::from_millis(agent.config.durable.stream_timeout_ms),
         run_token: run_token.as_deref(),
+        retry: &agent.config.durable.retry,
     };
     let reply = adapters::model(client, call, work, request, &mut Silent)
         .await

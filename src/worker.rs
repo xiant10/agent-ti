@@ -211,6 +211,13 @@ impl adapters::DeltaSink for LiveText<'_> {
             );
         }
     }
+    fn retry(&mut self, attempt: u32, at: u64, error: &str) {
+        let w = &self.journal.work;
+        self.journal.agent.hub.delta(
+            &w.session_id,
+            json!({"type":"retry","attempt":attempt,"at":at,"error":error}),
+        );
+    }
 }
 /// `memo` for one plugin's hook, journaled as a step of the run.
 struct Memo<'a> {
@@ -313,6 +320,7 @@ impl ModelPort for Journal {
                 thinking_level: &self.thinking_level,
                 timeout: Duration::from_millis(self.agent.config.durable.stream_timeout_ms),
                 run_token: run_token.as_deref(),
+                retry: &self.agent.config.durable.retry,
             };
             let mut live = LiveText {
                 journal: self,

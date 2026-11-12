@@ -51,17 +51,63 @@ pub struct ModelCall<'a> {
     pub timeout: Duration,
     /// The run's token for the model gateway, sent only where `identityHeaders` names `runToken`.
     pub run_token: Option<&'a str>,
+    /// `durable.retry`: how often, and how far apart, a failed request is tried again.
+    pub retry: &'a agent_ti_config::Retry,
 }
 /// Text and reasoning as they arrive, in batches.
 pub trait DeltaSink: Send {
     fn text(&mut self, text: &str);
     fn thinking(&mut self, text: &str);
+    /// The request failed and is tried again at `at` (milliseconds since the epoch).
+    fn retry(&mut self, _attempt: u32, _at: u64, _error: &str) {}
+}
+/// Why one attempt at a model request failed.
+struct Failure {
+    error: ExecutionError,
+    /// Worth trying again: the provider was unreachable, busy, or broke off its answer.
+    retryable: bool,
+    /// The provider's `Retry-After`.
+    after: Option<Duration>,
+    detail: String,
+}
+impl Failure {
+    fn fatal(error: ExecutionError, detail: impl Into<String>) -> Self {
+        Failure {
+            error,
+            retryable: false,
+            after: None,
+            detail: detail.into(),
+        }
+    }
+    fn transient(detail: impl Into<String>) -> Self {
+        Failure {
+            error: ExecutionError::Unavailable,
+            retryable: true,
+            after: None,
+            detail: detail.into(),
+        }
+    }
+}
+/// pi-ai's `retryDelayMs`: the base delay doubled for each attempt after the first, at most the
+/// policy's maximum. A provider's `Retry-After` is honored within the same maximum.
+fn retry_delay(policy: &agent_ti_config::Retry, attempt: u32, after: Option<Duration>) -> Duration {
+    let doubled = policy
+        .base_delay_ms
+        .saturating_mul(1u64 << attempt.saturating_sub(1).min(20));
+    let delay = Duration::from_millis(doubled.min(policy.max_delay_ms));
+    after.map_or(delay, |after| after.max(delay)).min(Duration::from_millis(policy.max_delay_ms))
+}
+/// Statuses a provider or gateway answers when trying again later may work.
+fn retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 /// agent-pi's floor on delta latency: a batch goes out at most every 100 ms, or at 16 KiB.
 const FLUSH_EVERY: Duration = Duration::from_millis(100);
 const FLUSH_BYTES: usize = 16 * 1024;
 const MAX_REPLY_BYTES: usize = 1024 * 1024;
 
+/// One model request, tried again as `call.retry` says while it fails in a way worth retrying and
+/// before any of its answer reached the client: text already shown can't be taken back.
 pub async fn model(
     client: &reqwest::Client,
     call: ModelCall<'_>,
@@ -90,15 +136,53 @@ pub async fn model(
             body["tool_choice"] = json!({"type":"function","function":{"name":name}});
         }
     }
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let mut delivered = false;
+        let failure = match model_attempt(client, &call, w, &body, sink, &mut delivered).await {
+            Ok(reply) => return Ok(reply),
+            Err(failure) => failure,
+        };
+        if !failure.retryable || delivered || attempt > call.retry.max_retries {
+            if failure.retryable {
+                tracing::warn!(agent = call.agent, session_id = %w.session_id, attempt, error = %failure.detail, "model request failed");
+            }
+            return Err(failure.error);
+        }
+        let delay = retry_delay(call.retry, attempt, failure.after);
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .saturating_add(delay)
+            .as_millis() as u64;
+        tracing::info!(agent = call.agent, session_id = %w.session_id, attempt, delay_ms = delay.as_millis() as u64, error = %failure.detail, "model request retried");
+        sink.retry(attempt, at, &failure.detail);
+        tokio::time::sleep(delay).await;
+    }
+}
+/// One try at a model request. `delivered` is set once any of its answer has gone to `sink`.
+async fn model_attempt(
+    client: &reqwest::Client,
+    call: &ModelCall<'_>,
+    w: &Work,
+    body: &Value,
+    sink: &mut dyn DeltaSink,
+    delivered: &mut bool,
+) -> Result<ModelReply, Failure> {
+    let config = call.config;
+    let invalid = |detail: &str| Failure::fatal(ExecutionError::InvalidResponse, detail);
     let mut req = client
         .post(format!(
             "{}/chat/completions",
             config.base_url.trim_end_matches('/')
         ))
         .timeout(call.timeout)
-        .json(&body);
+        .json(body);
     if let Some(env) = &config.api_key_env {
-        req = req.bearer_auth(std::env::var(env).map_err(|_| ExecutionError::Denied)?);
+        let key = std::env::var(env)
+            .map_err(|_| Failure::fatal(ExecutionError::Denied, format!("{env} is not set")))?;
+        req = req.bearer_auth(key);
     }
     for (field, header) in &config.identity_headers {
         let value = match field.as_str() {
@@ -118,14 +202,31 @@ pub async fn model(
     if let Some(trace) = &w.traceparent {
         req = req.header("traceparent", trace);
     }
-    let response = req.send().await.map_err(|_| ExecutionError::Unavailable)?;
+    let response = req
+        .send()
+        .await
+        .map_err(|e| Failure::transient(format!("request failed: {e}")))?;
     if !response.status().is_success() {
         let status = response.status();
+        let after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
         let body = response.text().await.unwrap_or_default();
         if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE || context_overflow(&body) {
-            return Err(ExecutionError::ContextOverflow);
+            return Err(Failure::fatal(ExecutionError::ContextOverflow, "context overflow"));
         }
-        return Err(ExecutionError::Unavailable);
+        let detail = format!("{status}: {}", body.chars().take(200).collect::<String>());
+        return Err(if retryable_status(status) {
+            Failure {
+                after,
+                ..Failure::transient(detail)
+            }
+        } else {
+            Failure::fatal(ExecutionError::Unavailable, detail)
+        });
     }
     let mut stream = response.bytes_stream();
     let mut reply = Reply::default();
@@ -137,10 +238,12 @@ pub async fn model(
         if !thinking.is_empty() {
             sink.thinking(thinking);
             thinking.clear();
+            *delivered = true;
         }
         if !text.is_empty() {
             sink.text(text);
             text.clear();
+            *delivered = true;
         }
         *last = tokio::time::Instant::now();
     };
@@ -154,10 +257,10 @@ pub async fn model(
             }
         };
         let Some(part) = part else { break };
-        let part = part.map_err(|_| ExecutionError::Unavailable)?;
+        let part = part.map_err(|e| Failure::transient(format!("answer broke off: {e}")))?;
         read += part.len();
         if read > MAX_REPLY_BYTES {
-            return Err(ExecutionError::InvalidResponse);
+            return Err(invalid("answer too long"));
         }
         buffer.extend_from_slice(&part);
         // A plain JSON answer is parsed whole at the end.
@@ -167,8 +270,10 @@ pub async fn model(
         }
         while let Some(end) = buffer.iter().position(|b| *b == b'\n') {
             let line: Vec<u8> = buffer.drain(..=end).collect();
-            let line = std::str::from_utf8(&line).map_err(|_| ExecutionError::InvalidResponse)?;
-            reply.line(line.trim_end(), &mut text, &mut thinking)?;
+            let line = std::str::from_utf8(&line).map_err(|_| invalid("answer isn't UTF-8"))?;
+            reply
+                .line(line.trim_end(), &mut text, &mut thinking)
+                .map_err(|e| Failure::fatal(e, "unreadable stream event"))?;
         }
         if tokio::time::Instant::now() >= last_flush + FLUSH_EVERY
             || text.len() + thinking.len() >= FLUSH_BYTES
@@ -177,14 +282,19 @@ pub async fn model(
         }
     }
     if reply.json {
-        return parse_model(&buffer);
+        return parse_model(&buffer).map_err(|e| Failure::fatal(e, "unreadable answer"));
     }
     let rest = std::str::from_utf8(&buffer)
-        .map_err(|_| ExecutionError::InvalidResponse)?
+        .map_err(|_| invalid("answer isn't UTF-8"))?
         .to_owned();
-    reply.line(rest.trim_end(), &mut text, &mut thinking)?;
+    reply
+        .line(rest.trim_end(), &mut text, &mut thinking)
+        .map_err(|e| Failure::fatal(e, "unreadable stream event"))?;
     flush(&mut text, &mut thinking, &mut last_flush);
-    reply.finish()
+    if !reply.finished {
+        return Err(Failure::transient("the stream ended before the answer did"));
+    }
+    reply.finish().map_err(|e| Failure::fatal(e, "answer too long"))
 }
 /// A chat-completions answer assembled from its stream.
 #[derive(Default)]

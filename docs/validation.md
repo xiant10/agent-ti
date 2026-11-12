@@ -482,3 +482,14 @@ Measured on one machine with a throwaway bench (one user, ten sequential turns, 
 The saving per tool call grows with the cost of a gateway round trip, which on `t10` includes token verification and exchange; that wasn't measured, as `t10` was down (Postgres had lost its databases). New test `tests/mcp_sessions.rs`: three calls share one session, a renewed token gets its own, and a call the server refuses for an ended session runs once on a new one. `cargo test --workspace` 116 passed; `scripts/test-local.mjs` passes, restarts included; the contract 20 of 20.
 
 Not changed, and worth deciding separately: Ti's `chat` profile has `alwaysOnTools: ["*"]`, so every model request carries every tool's schema (up to `maxActiveTools`, 40), where agent-pi's assistant offers three and preloads the rest by the input. A larger request takes the model longer to start answering.
+
+## 2026-11-12: model retries and single-flight lookups
+
+From the review of agent-ti against agent-pi, two stability gaps closed:
+
+- **A model request is tried again**, as pi-durable does. `durable.retry` (`maxRetries` 3, `baseDelayMs` 2,000, doubling, at most 60 s apart; a provider's `Retry-After` is honored within that) applies to a request that couldn't be sent, a 408, 425, 429, 5xx or 529, or a stream that broke off. Each retry sends a `retry` event (`attempt`, `at`, `error`), as agent-pi's mapper does. A request is tried again only before any of its answer reached the client, since text already shown can't be taken back; agent-pi retries after a partial too, and keeps the partial as an aborted message. A context overflow still compacts, and a 400 or 401 fails at once. Before, any of these failed the turn. Compaction's summary request uses the same policy. New test `tests/model_retry.rs`.
+- **Concurrent lookups of a grant, a token, tenant skills or tenant connectors** wait for one caller doing it (`src/flights.rs`). The earlier `Notify` could miss its wake-up when the lookup finished between a waiter taking it and waiting on it. And a leading caller that was dropped, for example with a client disconnecting during `session.prompt`, left its entry behind, so every later caller for that key waited forever. The leader now holds a guard that releases its waiters however it ends.
+
+`cargo test --workspace` 122 passed.
+
+On namespace `t10`, preview images `t10/agent-ti:retry-preview` and `t10/agents:retry-preview`: with `ai-gateway-llm` scaled to 0, a turn sent `retry` events at 0, 2 and 6 s and answered at 16.6 s once it was back. Ti with `alwaysOnTools` cut from `["*"]` to collab's five core tools spent 33,336 input tokens on a seven-turn session, against 54,383 with every tool, and called the same tools. With `work_list` alone always on, preloading missed `work_create` and the model said it couldn't create tasks instead of searching, so the core set stays on.

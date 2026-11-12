@@ -1,3 +1,4 @@
+use crate::flights::Flights;
 use crate::control_copy::ControlCopies;
 use crate::grants::GrantBroker;
 use agent_ti_config::{SkillConfig, TenantSkillRecord, apply_tenant_skills};
@@ -45,7 +46,7 @@ pub struct TenantSkills {
     client: reqwest::Client,
     entries: RwLock<HashMap<String, TenantSkillEntry>>,
     changes: RwLock<HashMap<String, u64>>,
-    in_flight: Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+    in_flight: Flights<String>,
     listeners: RwLock<Vec<TenantChangeListener>>,
     fresh_duration: Duration,
     timeout_duration: Duration,
@@ -66,7 +67,7 @@ impl TenantSkills {
             client,
             entries: RwLock::new(HashMap::new()),
             changes: RwLock::new(HashMap::new()),
-            in_flight: Mutex::new(HashMap::new()),
+            in_flight: Flights::default(),
             listeners: RwLock::new(Vec::new()),
             fresh_duration: FRESH_DURATION,
             timeout_duration: TIMEOUT_DURATION,
@@ -155,37 +156,16 @@ impl TenantSkills {
         }
 
         // Deduplicate concurrent checks for the same tenant
-        let notify = {
-            let mut in_flight = self.in_flight.lock().await;
-            if let Some(existing) = in_flight.get(tenant) {
-                Some(existing.clone())
-            } else {
-                let n = Arc::new(tokio::sync::Notify::new());
-                in_flight.insert(tenant.to_string(), n);
-                None
-            }
-        };
-
-        if let Some(n) = notify {
-            n.notified().await;
+        let Some(_flight) = self.in_flight.start(&tenant.to_string()).await else {
             let entries = self.entries.read().await;
             if let Some(entry) = entries.get(tenant) {
                 return entry.skills.clone();
             }
             return self.base.clone();
-        }
+        };
 
         let existing_entry = self.entries.read().await.get(tenant).cloned();
-        let result = self.check_tenant(tenant, existing_entry).await;
-
-        {
-            let mut in_flight = self.in_flight.lock().await;
-            if let Some(n) = in_flight.remove(tenant) {
-                n.notify_waiters();
-            }
-        }
-
-        result
+        self.check_tenant(tenant, existing_entry).await
     }
 
     async fn check_tenant(

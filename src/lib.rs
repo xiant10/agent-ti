@@ -8,6 +8,7 @@ pub mod children;
 pub mod compaction;
 pub mod control_copy;
 pub mod events;
+pub mod flights;
 pub mod flow;
 pub mod grants;
 pub mod maintenance;

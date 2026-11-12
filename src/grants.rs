@@ -3,13 +3,14 @@
 //! A user's request opens or extends a grant at the auth service. Tool calls get short-lived tokens
 //! minted from that grant, allowing long-running turns to survive restarts and progress while the user is offline.
 use crate::auth::Principal;
+use crate::flights::Flights;
 use agent_ti_config::GrantsConfig;
 use agent_ti_store::{AgentStore, StoredGrant, UserScope};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 const RENEW_BEFORE: Duration = Duration::from_secs(60);
 const CHAIN_CACHE_DURATION: Duration = Duration::from_secs(60);
@@ -54,9 +55,9 @@ pub struct GrantBroker {
     tokens: Arc<RwLock<HashMap<String, CachedToken>>>,
     service_token: Arc<RwLock<Option<CachedToken>>>,
     confirmed: Arc<RwLock<HashMap<String, Instant>>>,
-    in_flight_attach: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
-    in_flight_mint: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
-    in_flight_service: Arc<Mutex<Option<Arc<tokio::sync::Notify>>>>,
+    in_flight_attach: Flights<String>,
+    in_flight_mint: Flights<String>,
+    in_flight_service: Flights<()>,
     retry_delay: Duration,
 }
 
@@ -73,9 +74,9 @@ impl GrantBroker {
             tokens: Arc::new(RwLock::new(HashMap::new())),
             service_token: Arc::new(RwLock::new(None)),
             confirmed: Arc::new(RwLock::new(HashMap::new())),
-            in_flight_attach: Arc::new(Mutex::new(HashMap::new())),
-            in_flight_mint: Arc::new(Mutex::new(HashMap::new())),
-            in_flight_service: Arc::new(Mutex::new(None)),
+            in_flight_attach: Flights::default(),
+            in_flight_mint: Flights::default(),
+            in_flight_service: Flights::default(),
             retry_delay: Duration::from_millis(200),
         }
     }
@@ -101,33 +102,15 @@ impl GrantBroker {
         let parent = principal.claims.get("grant").and_then(Value::as_str);
 
         // Deduplicate concurrent attach calls for the same session
-        let (notify, is_leader) = {
-            let mut in_flight = self.in_flight_attach.lock().await;
-            if let Some(existing) = in_flight.get(session_id) {
-                (existing.clone(), false)
-            } else {
-                let n = Arc::new(tokio::sync::Notify::new());
-                in_flight.insert(session_id.to_string(), n.clone());
-                (n, true)
-            }
+        let _flight = match self.in_flight_attach.start(&session_id.to_string()).await {
+            Some(flight) => Some(flight),
+            None => match self.grant_of(store, session_id).await {
+                Some(g) => return Ok(g),
+                None => None,
+            },
         };
-
-        if !is_leader {
-            notify.notified().await;
-            if let Some(g) = self.grant_of(store, session_id).await {
-                return Ok(g);
-            }
-        }
-
-        let result = self
-            .attach_internal(store, scope, session_id, principal, parent, traceparent)
-            .await;
-
-        let mut in_flight = self.in_flight_attach.lock().await;
-        in_flight.remove(session_id);
-        notify.notify_waiters();
-
-        result
+        self.attach_internal(store, scope, session_id, principal, parent, traceparent)
+            .await
     }
 
     async fn attach_internal(
@@ -336,32 +319,14 @@ impl GrantBroker {
         }
 
         // Deduplicate concurrent minting for the same grant_id
-        let (notify, is_leader) = {
-            let mut in_flight = self.in_flight_mint.lock().await;
-            if let Some(existing) = in_flight.get(grant_id) {
-                (existing.clone(), false)
-            } else {
-                let n = Arc::new(tokio::sync::Notify::new());
-                in_flight.insert(grant_id.to_string(), n.clone());
-                (n, true)
-            }
-        };
-
-        if !is_leader {
-            notify.notified().await;
+        let flight = self.in_flight_mint.start(&grant_id.to_string()).await;
+        if flight.is_none() {
             let tokens = self.tokens.read().await;
             if let Some(cached) = tokens.get(grant_id) {
                 return Ok(cached.token.clone());
             }
         }
-
-        let result = self.mint_internal(grant_id).await;
-
-        let mut in_flight = self.in_flight_mint.lock().await;
-        in_flight.remove(grant_id);
-        notify.notify_waiters();
-
-        result
+        self.mint_internal(grant_id).await
     }
 
     async fn mint_internal(&self, grant_id: &str) -> Result<String, GrantError> {
@@ -439,19 +404,8 @@ impl GrantBroker {
             }
         }
 
-        let (notify, is_leader) = {
-            let mut in_flight = self.in_flight_service.lock().await;
-            if let Some(existing) = in_flight.as_ref() {
-                (existing.clone(), false)
-            } else {
-                let n = Arc::new(tokio::sync::Notify::new());
-                *in_flight = Some(n.clone());
-                (n, true)
-            }
-        };
-
-        if !is_leader {
-            notify.notified().await;
+        let flight = self.in_flight_service.start(&()).await;
+        if flight.is_none() {
             let service = self.service_token.read().await;
             if let Some(cached) = service.as_ref() {
                 return Ok(cached.token.clone());
@@ -459,20 +413,10 @@ impl GrantBroker {
         }
 
         let req = json!({ "grant_type": "client_credentials" });
-        let result = match self.token_request(&req).await {
-            Ok(cached) => {
-                let tok = cached.token.clone();
-                *self.service_token.write().await = Some(cached);
-                Ok(tok)
-            }
-            Err(e) => Err(e),
-        };
-
-        let mut in_flight = self.in_flight_service.lock().await;
-        *in_flight = None;
-        notify.notify_waiters();
-
-        result
+        let cached = self.token_request(&req).await?;
+        let tok = cached.token.clone();
+        *self.service_token.write().await = Some(cached);
+        Ok(tok)
     }
 
     async fn token_request(&self, params: &Value) -> Result<CachedToken, GrantError> {
