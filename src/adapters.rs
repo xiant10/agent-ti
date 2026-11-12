@@ -4,7 +4,11 @@ use agent_ti_core::*;
 use agent_ti_store::Work;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{LazyLock, Mutex},
+    time::{Duration, Instant},
+};
 
 pub async fn bounded(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, ExecutionError> {
     if !response.status().is_success()
@@ -334,6 +338,60 @@ struct McpClient<'a> {
     session: Option<reqwest::header::HeaderValue>,
     timeout: Duration,
     grant_token: Option<&'a str>,
+    /// The last request reached the server and it answered with success.
+    answered: bool,
+    /// The last request named a session the server no longer has, so it wasn't run.
+    stale: bool,
+}
+/// Open MCP sessions by server and credential, reused between tool calls as agent-pi keeps a
+/// client per grant: a call is then one request, not `initialize`, `initialized` and the call.
+/// A grant's renewed token opens a session of its own; idle ones are dropped.
+static SESSIONS: LazyLock<Mutex<HashMap<String, KeptSession>>> = LazyLock::new(Default::default);
+const KEPT_SESSIONS: usize = 256;
+const SESSION_IDLE: Duration = Duration::from_secs(300);
+struct KeptSession {
+    /// `None` for a server that runs without sessions.
+    id: Option<reqwest::header::HeaderValue>,
+    used: Instant,
+}
+fn session_key(server: &McpServerConfig, grant_token: Option<&str>) -> String {
+    format!("{}\0{}", server.url, grant_token.unwrap_or(""))
+}
+fn kept_session(key: &str) -> Option<Option<reqwest::header::HeaderValue>> {
+    let mut sessions = SESSIONS.lock().unwrap();
+    let kept = sessions.get_mut(key)?;
+    if kept.used.elapsed() > SESSION_IDLE {
+        sessions.remove(key);
+        return None;
+    }
+    kept.used = Instant::now();
+    Some(kept.id.clone())
+}
+/// Keeps the client's session after a call the server answered, and drops it after one that
+/// failed on the way, so the next call starts a new one.
+fn settle_session(key: String, c: &McpClient<'_>) {
+    let mut sessions = SESSIONS.lock().unwrap();
+    if !c.answered {
+        sessions.remove(&key);
+        return;
+    }
+    sessions.retain(|_, s| s.used.elapsed() <= SESSION_IDLE);
+    if sessions.len() >= KEPT_SESSIONS
+        && !sessions.contains_key(&key)
+        && let Some(oldest) = sessions
+            .iter()
+            .min_by_key(|(_, s)| s.used)
+            .map(|(k, _)| k.clone())
+    {
+        sessions.remove(&oldest);
+    }
+    sessions.insert(
+        key,
+        KeptSession {
+            id: c.session.clone(),
+            used: Instant::now(),
+        },
+    );
 }
 impl McpClient<'_> {
     fn request(&self, body: &Value) -> reqwest::RequestBuilder {
@@ -383,6 +441,14 @@ impl McpClient<'_> {
                     "the tool server is unreachable".to_owned()
                 }
             })?;
+        let status = response.status();
+        self.answered = status.is_success();
+        // MCP answers 404 for a session it ended; some servers say 400.
+        self.stale = self.session.is_some()
+            && matches!(
+                status,
+                reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::BAD_REQUEST
+            );
         if let Some(s) = response.headers().get("mcp-session-id") {
             self.session = Some(s.clone());
         }
@@ -391,7 +457,6 @@ impl McpClient<'_> {
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.starts_with("text/event-stream"));
-        let status = response.status();
         let bytes = bounded(response, 1024 * 1024)
             .await
             .map_err(|_| format!("the tool server answered HTTP {status}"))?;
@@ -430,6 +495,8 @@ impl McpClient<'_> {
             session: None,
             timeout,
             grant_token,
+            answered: false,
+            stale: false,
         };
         c.call(1, "initialize", json!({"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"agent-ti","version":env!("CARGO_PKG_VERSION")}}))
             .await?;
@@ -495,13 +562,34 @@ pub async fn mcp_call(
     meta: Option<Value>,
 ) -> ToolOutcome {
     let timeout = Duration::from_millis(server.call_timeout_ms);
+    let mut params = json!({"name": name, "arguments": args});
+    if let Some(m) = meta {
+        params["_meta"] = m;
+    }
+    let key = session_key(server, grant_token);
     let result = async {
-        let mut c = McpClient::open(client, server, timeout, grant_token).await?;
-        let mut params = json!({"name": name, "arguments": args});
-        if let Some(m) = meta {
-            params["_meta"] = m;
+        if let Some(session) = kept_session(&key) {
+            let mut c = McpClient {
+                client,
+                server,
+                session,
+                timeout,
+                grant_token,
+                answered: false,
+                stale: false,
+            };
+            let result = c.call(2, "tools/call", params.clone()).await;
+            // A session the server has ended didn't run the call, so it goes again on a new one.
+            if !c.stale {
+                settle_session(key, &c);
+                return result;
+            }
+            SESSIONS.lock().unwrap().remove(&key);
         }
-        c.call(2, "tools/call", params).await
+        let mut c = McpClient::open(client, server, timeout, grant_token).await?;
+        let result = c.call(2, "tools/call", params).await;
+        settle_session(key, &c);
+        result
     }
     .await;
     match result {

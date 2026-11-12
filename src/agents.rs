@@ -667,18 +667,22 @@ impl Agent {
         }
     }
 
-    /// Lists the tools of servers not listed yet. A server that is down is retried on a later run.
-    pub async fn refresh_tools(&self, client: &reqwest::Client) {
-        for (index, server) in self.config.mcp_servers.iter().enumerate() {
-            let due = {
-                let catalog = self.catalog.read().unwrap();
-                let (tools, tried) = &catalog.servers[index];
-                tools.is_none() && tried.is_none_or(|t| t.elapsed() > Duration::from_secs(30))
-            };
-            if !due {
-                continue;
+    /// Servers not listed yet whose last try is over 30 s old, each marked as tried now, so
+    /// callers at the same time don't list it twice.
+    fn due_servers(&self) -> Vec<usize> {
+        let mut catalog = self.catalog.write().unwrap();
+        let mut due = Vec::new();
+        for (index, (tools, tried)) in catalog.servers.iter_mut().enumerate() {
+            if tools.is_none() && tried.is_none_or(|t| t.elapsed() > Duration::from_secs(30)) {
+                *tried = Some(Instant::now());
+                due.push(index);
             }
-            self.catalog.write().unwrap().servers[index].1 = Some(Instant::now());
+        }
+        due
+    }
+    async fn list_servers(&self, due: Vec<usize>, client: &reqwest::Client) {
+        let listings = due.into_iter().map(|index| async move {
+            let server = &self.config.mcp_servers[index];
             match adapters::mcp_list(client, server).await {
                 Ok(tools) => {
                     let entries = self.filter_and_validate_tools(index, server, tools);
@@ -689,7 +693,25 @@ impl Agent {
                     tracing::warn!(agent = %self.name, server = %server.name, error = %e, "MCP server unavailable; retrying later");
                 }
             }
+        });
+        futures_util::future::join_all(listings).await;
+    }
+    /// Lists the tools of servers not listed yet, all at once. A server that is down is retried
+    /// later.
+    pub async fn refresh_tools(&self, client: &reqwest::Client) {
+        let due = self.due_servers();
+        self.list_servers(due, client).await;
+    }
+    /// [`refresh_tools`](Self::refresh_tools) off the run's path, as agent-pi connects servers in
+    /// the background: a server that is down never holds up a turn, and its tools are offered
+    /// from the first run after it answers.
+    pub fn refresh_tools_later(self: &Arc<Self>, client: &reqwest::Client) {
+        let due = self.due_servers();
+        if due.is_empty() {
+            return;
         }
+        let (agent, client) = (self.clone(), client.clone());
+        tokio::spawn(async move { agent.list_servers(due, &client).await });
     }
     pub fn platform_tool_names(&self) -> Vec<String> {
         let catalog = self.catalog.read().unwrap();
@@ -1279,8 +1301,6 @@ pub async fn load_all(host: &HostConfig, client: &reqwest::Client) -> Result<Vec
         tracing::info!(agent = %agent.name, %location, version = %agent.version, instance = %agent.instance_id, "agent loaded");
         agents.push(agent);
     }
-    for agent in &agents {
-        agent.refresh_tools(client).await;
-    }
+    futures_util::future::join_all(agents.iter().map(|a| a.refresh_tools(client))).await;
     Ok(agents)
 }

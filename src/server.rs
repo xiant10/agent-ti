@@ -374,6 +374,55 @@ fn admitted(a: Admission) -> Value {
         }
     }
 }
+/// The session's state, and the skills and tenant customization its turn pins: the session
+/// owner's drafts in their own test conversation, or else the published ones, less the skills the
+/// customization turns off.
+async fn turn_lookup(
+    agent: &Agent,
+    s: &UserScope,
+    session_id: &str,
+) -> Result<
+    (
+        SessionState,
+        Arc<Vec<agent_ti_config::SkillConfig>>,
+        Option<Arc<crate::tenant_config::TenantConfig>>,
+    ),
+    StoreError,
+> {
+    let session_state = agent.store.state(s, session_id).await?;
+    let metadata = &session_state.session.metadata;
+    let skill_draft = metadata
+        .get("skillDraft")
+        .and_then(Value::as_str)
+        .filter(|n| !n.is_empty());
+    let config_draft = metadata.get("configDraft").and_then(Value::as_bool) == Some(true);
+    let skills = async {
+        match (&agent.tenant_skills, skill_draft) {
+            (Some(ts), Some(draft)) => ts.with_draft(Some(&s.tenant_id), &s.user_id, draft).await,
+            (Some(ts), None) => ts.for_tenant(Some(&s.tenant_id)).await,
+            (None, _) => Arc::new(agent.config.skills.clone()),
+        }
+    };
+    let config = async {
+        match &agent.tenant_config {
+            Some(tc) if config_draft => Some(tc.draft(&s.tenant_id, &s.user_id).await),
+            Some(tc) => Some(tc.for_principal(&s.tenant_id, &s.user_id).await),
+            None => None,
+        }
+    };
+    let (turn_skills, turn_config) = tokio::join!(skills, config);
+    let turn_skills = match &turn_config {
+        Some(c) if !c.skills_off.is_empty() => Arc::new(
+            turn_skills
+                .iter()
+                .filter(|sk| c.skill_on(&sk.name))
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
+        _ => turn_skills,
+    };
+    Ok((session_state, turn_skills, turn_config))
+}
 /// `session.prompt`: hooks run before admission, so a rejection is a 422 and a plugin's reply never
 /// queues for the model. A retried `requestId` returns what it became without running hooks again.
 #[allow(clippy::result_large_err, clippy::too_many_arguments)] // the error is the finished HTTP response
@@ -394,20 +443,23 @@ async fn prompt(
         ));
     }
     let traceparent = headers.get("traceparent").and_then(|v| v.to_str().ok());
-    if let Some(ref broker) = agent.grants {
-        broker
-            .attach(&agent.store, &s, session_id, principal, traceparent)
-            .await
-            .map_err(|e| match e {
-                crate::grants::GrantError::Expired => {
-                    fail(StatusCode::UNAUTHORIZED, "grant expired")
-                }
-                crate::grants::GrantError::Stopped => fail(StatusCode::FORBIDDEN, "grant stopped"),
-                crate::grants::GrantError::Unavailable(m) => {
-                    fail(StatusCode::SERVICE_UNAVAILABLE, &m)
-                }
-            })?;
-    }
+    let attach = async {
+        match agent.grants {
+            Some(ref broker) => broker
+                .attach(&agent.store, &s, session_id, principal, traceparent)
+                .await
+                .map(|_| ()),
+            None => Ok(()),
+        }
+    };
+    // Extending the grant and reading the turn's session, skills and customization each may wait
+    // on another service, so they go together.
+    let (attached, looked_up) = tokio::join!(attach, turn_lookup(agent, &s, session_id));
+    attached.map_err(|e| match e {
+        crate::grants::GrantError::Expired => fail(StatusCode::UNAUTHORIZED, "grant expired"),
+        crate::grants::GrantError::Stopped => fail(StatusCode::FORBIDDEN, "grant stopped"),
+        crate::grants::GrantError::Unavailable(m) => fail(StatusCode::SERVICE_UNAVAILABLE, &m),
+    })?;
     let when_busy = match when_busy_override {
         Some(wb) => Some(wb.to_string()),
         None => params
@@ -514,47 +566,7 @@ async fn prompt(
             }
         }
     }
-    let session_state = agent.store.state(&s, session_id).await.map_err(storage)?;
-    let skill_draft = session_state
-        .session
-        .metadata
-        .get("skillDraft")
-        .and_then(Value::as_str);
-
-    let turn_skills = if let Some(ref ts) = agent.tenant_skills {
-        if let Some(draft_name) = skill_draft.filter(|n| !n.is_empty()) {
-            ts.with_draft(Some(&s.tenant_id), &s.user_id, draft_name)
-                .await
-        } else {
-            ts.for_tenant(Some(&s.tenant_id)).await
-        }
-    } else {
-        Arc::new(agent.config.skills.clone())
-    };
-    // The tenant's customization for this turn: the session owner's draft in their own test
-    // conversation, or else the published one. It's pinned with the skills, so the whole turn,
-    // and any child it starts, sees one version.
-    let config_draft = session_state
-        .session
-        .metadata
-        .get("configDraft")
-        .and_then(Value::as_bool)
-        == Some(true);
-    let turn_config = match &agent.tenant_config {
-        Some(tc) if config_draft => Some(tc.draft(&s.tenant_id, &s.user_id).await),
-        Some(tc) => Some(tc.for_principal(&s.tenant_id, &s.user_id).await),
-        None => None,
-    };
-    let turn_skills = match &turn_config {
-        Some(c) if !c.skills_off.is_empty() => Arc::new(
-            turn_skills
-                .iter()
-                .filter(|sk| c.skill_on(&sk.name))
-                .cloned()
-                .collect::<Vec<_>>(),
-        ),
-        _ => turn_skills,
-    };
+    let (session_state, turn_skills, turn_config) = looked_up.map_err(storage)?;
     agent
         .turn_pins
         .pin(session_id, turn_skills.clone(), turn_config.clone())

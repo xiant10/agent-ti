@@ -142,7 +142,7 @@ Cancellation and interrupt reach the worker through an in-process cancellation t
 
 Copied from agent-pi: register every tool, send few.
 
-1. **Catalog.** Every MCP server's tools, and every plugin's tools, are registered as `<prefix><tool>`. Registering costs nothing per request. A server that is down at startup is retried; `notifications/tools/list_changed` re-lists it.
+1. **Catalog.** Every MCP server's tools, and every plugin's tools, are registered as `<prefix><tool>`. Registering costs nothing per request. Servers are listed at startup all at once; one that is down is retried in the background at most every 30 s, never inside a run, so it never holds up a turn, and its tools are offered from the first run after it answers, as in agent-pi. `notifications/tools/list_changed` re-lists a server. A tool call reuses the MCP session of its server and credential (a grant's token), as agent-pi keeps a client per grant, so a call is one request rather than `initialize`, `initialized` and the call; a session the server ended (404 or 400) is replaced and the call sent once more, since the server didn't run it. Sessions idle 5 minutes, or past 256, are dropped.
 2. **Core set.** A new session offers only the meta-tools (`load_skill`, `search_tools`) and the profile's `alwaysOnTools`.
 3. **Skills.** Markdown files with `name`, `description`, `tools` patterns and `keywords` frontmatter, in agent-pi's format, so the same skill files work in both. The system prompt lists names and descriptions. `load_skill` returns the instructions and activates the matching tools in one step.
 4. **Search.** `search_tools` runs BM25 over names and descriptions and activates the top matches.

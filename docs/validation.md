@@ -457,3 +457,28 @@ On namespace `t10`, with preview images of control, the tool gateway, the proper
 | `property`'s runtime isn't touched by Acme's `ti` list; the gateway records its runs as `property`'s; it calls `property_rules` through its own runtime | Passes |
 
 A turn through the property app's own route, with its grant as the parent, also ran as `svc_agent-ti-property`.
+
+## 2026-11-11: turn latency
+
+Why Ti felt slower than agent-pi's assistant, and what changed. With agent-pi's assistant `agent.json` (no MCP servers, no grants) the two were already even: `scripts/perf-compare.mjs` at 1 and 10 users gave agent-ti 330 ms to first token and 930 ms per turn, agent-pi 435 ms and 935 ms. The gap was in what Ti's config switches on: MCP servers and tool calls.
+
+| Cause | Before | After |
+| --- | --- | --- |
+| A run listed any MCP server not listed yet, inside the run, one server after another, with a 10 s timeout | With one server down, a turn about every 30 s waited for its timeout (and startup waited 10 s per such server). On `t10` the log showed `modules` and `knowledge` timing out | Listed in the background, never inside a run, as agent-pi does; startup lists all servers at once |
+| Each tool call opened a new MCP session: `initialize`, `notifications/initialized`, then `tools/call` | Three requests per call through `ai-gateway-tools`, each verified, exchanged at auth-server and forwarded | One request per call on a kept session per server and token; a session the server ended is replaced and the call sent once more |
+| `session.prompt` extended the grant at auth-server, then read the session, then the tenant's skills, then its customization | Each waited on the one before; skills and customization go to control when their 10 s copy is stale | Run together |
+| A run read the whole history three times before its first model call, two of them on the store's one writer connection | Other sessions' writes queued behind those reads | Read once, on a reader connection; the compaction head has its own small query |
+
+Measured on one machine with a throwaway bench (one user, ten sequential turns, each calling one MCP tool; mock model 300 ms to first token; mock MCP server 30 ms per request; release build):
+
+| | p50 turn | p95 | worst | `initialize` per 10 calls |
+| --- | --- | --- | --- | --- |
+| agent-pi | 1077 ms | 1191 ms | 1279 ms | 0 (connected at startup) |
+| agent-ti before | 1126 ms | 1137 ms | 1138 ms | 10, plus the listener's |
+| agent-ti after | 1066 ms | 1124 ms | 1140 ms | 0, plus the listener's |
+| agent-ti before, a second MCP server not answering, 40 turns | 1127 ms | 1735 ms | 11133 ms | |
+| agent-ti after, the same | 1063 ms | 1080 ms | 1138 ms | |
+
+The saving per tool call grows with the cost of a gateway round trip, which on `t10` includes token verification and exchange; that wasn't measured, as `t10` was down (Postgres had lost its databases). New test `tests/mcp_sessions.rs`: three calls share one session, a renewed token gets its own, and a call the server refuses for an ended session runs once on a new one. `cargo test --workspace` 116 passed; `scripts/test-local.mjs` passes, restarts included; the contract 20 of 20.
+
+Not changed, and worth deciding separately: Ti's `chat` profile has `alwaysOnTools: ["*"]`, so every model request carries every tool's schema (up to `maxActiveTools`, 40), where agent-pi's assistant offers three and preloads the rest by the input. A larger request takes the model longer to start answering.

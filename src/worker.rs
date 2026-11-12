@@ -1138,15 +1138,26 @@ fn generation_prefix(generation: u32) -> String {
 /// The head of the summary a new run starts from, compacting first as pi-durable does: over the
 /// blocking threshold the run waits for its summary, and fails if making it fails (one that finds
 /// nothing to compact goes ahead); over the background threshold a summary is made for later runs.
+/// With the history it read, when the run starts from the summary that history began with.
 async fn start_compacted(
     host: &Arc<Host>,
     agent: &Arc<Agent>,
     work: &Work,
     instructions: &[String],
     model_name: &str,
-) -> Result<Option<i64>, ExecutionError> {
+) -> Result<(Option<i64>, Option<Vec<Message>>), ExecutionError> {
     let model = &agent.config.models[model_name];
-    let history = agent.store.history(work).await.map_err(error)?;
+    let (summary, messages) = agent
+        .store
+        .compaction_source(&work.scope, &work.session_id)
+        .await
+        .map_err(error)?;
+    let read_head = summary.as_ref().map(|s| s.head);
+    let mut history = Vec::with_capacity(messages.len() + 1);
+    if let Some(summary) = summary {
+        history.push(Message::text("user", summary.message()));
+    }
+    history.extend(messages.into_iter().map(|(_, m)| m));
     let tokens = compaction::context_tokens(instructions, &history);
     let window = model.context_window.unwrap_or(128_000);
     match compaction::threshold(tokens, window, &agent.config.durable.compaction) {
@@ -1158,15 +1169,15 @@ async fn start_compacted(
         }
         None => {}
     }
-    compaction_head(agent, work).await
+    let head = compaction_head(agent, work).await?;
+    Ok((head, (head == read_head).then_some(history)))
 }
 async fn compaction_head(agent: &Agent, work: &Work) -> Result<Option<i64>, ExecutionError> {
-    let (summary, _) = agent
+    agent
         .store
-        .compaction_source(&work.scope, &work.session_id)
+        .compaction_head(&work.scope, &work.session_id)
         .await
-        .map_err(error)?;
-    Ok(summary.map(|s| s.head))
+        .map_err(error)
 }
 async fn run(
     host: Arc<Host>,
@@ -1254,26 +1265,29 @@ async fn run(
         unsafe_effect: false,
         event: None,
     };
-    let head = match agent
+    let (head, read) = match agent
         .store
         .prepare(&work, context_step.clone())
         .await
         .map_err(error)?
     {
-        Prepared::Recorded(value) => value["head"].as_i64(),
+        Prepared::Recorded(value) => (value["head"].as_i64(), None),
         _ => {
-            let head =
+            let (head, read) =
                 start_compacted(&host, &agent, &work, &spec.instructions, &model_name).await?;
             agent
                 .store
                 .record(&work, &context_step.id, json!({ "head": head }), None)
                 .await
                 .map_err(error)?;
-            head
+            (head, read)
         }
     };
-    let history = agent.store.history_at(&work, head).await.map_err(error)?;
-    agent.refresh_tools(&host.client).await;
+    let history = match read {
+        Some(history) => history,
+        None => agent.store.history_at(&work, head).await.map_err(error)?,
+    };
+    agent.refresh_tools_later(&host.client);
     let session_tools = agent
         .store
         .get_session_tools(&work.scope, &work.session_id)

@@ -776,13 +776,22 @@ impl AgentStore {
         }
         Ok(result)
     }
+    /// The head of the newest compaction, without reading the messages after it.
+    pub async fn compaction_head(
+        &self,
+        s: &UserScope,
+        session_id: &str,
+    ) -> StoreResult<Option<i64>> {
+        sqlx::query_scalar("SELECT head FROM compactions WHERE tenant_id=? AND agent_id=? AND session_id=? ORDER BY head DESC LIMIT 1")
+            .bind(&s.tenant_id).bind(&s.agent_id).bind(session_id).fetch_optional(&self.readers).await.map_err(db)
+    }
     /// The newest compaction, and the messages after its head with their sequences.
     pub async fn compaction_source(
         &self,
         s: &UserScope,
         session_id: &str,
     ) -> StoreResult<(Option<Summary>, Vec<(i64, Message)>)> {
-        let mut conn = self.begin().await?;
+        let mut conn = self.read().await?;
         let summary = sqlx::query("SELECT head,summary FROM compactions WHERE tenant_id=? AND agent_id=? AND session_id=? ORDER BY head DESC LIMIT 1")
             .bind(&s.tenant_id).bind(&s.agent_id).bind(session_id).fetch_optional(&mut *conn).await.map_err(db)?
             .map(|r| Summary { head: r.get(0), text: r.get(1) });
