@@ -126,6 +126,8 @@ pub struct TranscriptEntry {
     pub turn_id: String,
     pub request_id: String,
     pub status: String,
+    /// When it was written, in Unix milliseconds; none for messages from before times were kept.
+    pub created_at: Option<i64>,
 }
 #[derive(Clone, Debug)]
 pub struct TranscriptPage {

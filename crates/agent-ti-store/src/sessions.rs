@@ -143,7 +143,7 @@ async fn message(
     }
     let seq: i64 = sqlx::query_scalar("UPDATE sessions SET next_message=next_message+1 WHERE tenant_id=? AND agent_id=? AND session_id=? RETURNING next_message")
         .bind(&s.tenant_id).bind(&s.agent_id).bind(session_id).fetch_one(&mut **tx).await.map_err(db)?;
-    sqlx::query("INSERT INTO messages VALUES(?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO messages(tenant_id,agent_id,session_id,sequence,command_id,position,payload,created_at) VALUES(?,?,?,?,?,?,?,?)")
         .bind(&s.tenant_id)
         .bind(&s.agent_id)
         .bind(session_id)
@@ -151,6 +151,7 @@ async fn message(
         .bind(command_id)
         .bind(position)
         .bind(encode(m)?)
+        .bind(now_ms())
         .execute(&mut **tx)
         .await
         .map_err(db)?;
@@ -356,7 +357,7 @@ impl AgentStore {
         owned(&mut conn, s, id).await?;
         let limit = limit.clamp(1, 100) as usize;
         // Messages no command wrote (a plugin's history, a task's note) have no turn.
-        let rows=sqlx::query("SELECT m.sequence,m.payload,COALESCE(c.turn_id,''),COALESCE(c.request_key,''),COALESCE(c.status,'completed') FROM messages m LEFT JOIN commands c USING(tenant_id,agent_id,session_id,command_id) WHERE m.tenant_id=? AND m.agent_id=? AND m.session_id=? AND m.sequence<? AND json_extract(m.payload,'$.role')<>'record' ORDER BY m.sequence DESC LIMIT ?")
+        let rows=sqlx::query("SELECT m.sequence,m.payload,COALESCE(c.turn_id,''),COALESCE(c.request_key,''),COALESCE(c.status,'completed'),m.created_at FROM messages m LEFT JOIN commands c USING(tenant_id,agent_id,session_id,command_id) WHERE m.tenant_id=? AND m.agent_id=? AND m.session_id=? AND m.sequence<? AND json_extract(m.payload,'$.role')<>'record' ORDER BY m.sequence DESC LIMIT ?")
             .bind(&s.tenant_id).bind(&s.agent_id).bind(id).bind(before).bind((limit+1) as i64).fetch_all(&mut *conn).await.map_err(db)?;
         let has_more = rows.len() > limit;
         let mut entries = rows
@@ -369,6 +370,7 @@ impl AgentStore {
                     turn_id: r.get(2),
                     request_id: r.get(3),
                     status: r.get(4),
+                    created_at: r.get(5),
                 })
             })
             .collect::<StoreResult<Vec<_>>>()?;

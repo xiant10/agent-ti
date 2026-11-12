@@ -1052,6 +1052,9 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
                         if let Some(source) = &e.message.source {
                             value["source"] = json!(source);
                         }
+                        if let Some(at) = e.created_at {
+                            value["at"] = json!(at);
+                        }
                         // A task's report or note: data from a child, not something the user said.
                         if e.message.role == "user"
                             && let Some(line) = crate::tasks::transcript_line(&e.message.content)

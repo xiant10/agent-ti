@@ -351,6 +351,8 @@ async fn workbench_metadata_activity_and_transcript_pagination_are_durable() {
     assert!(page.has_more);
     assert_eq!(page.entries[0].request_id, "request2");
     assert_eq!(page.entries[1].message.content, "answer2");
+    // Each message keeps when it was written, for clients to show.
+    assert!(page.entries.iter().all(|e| e.created_at.is_some_and(|at| at > 1_700_000_000_000)));
     let older = store
         .transcript(&s, id, page.entries[0].sequence, 4)
         .await
