@@ -395,4 +395,82 @@ assert.equal((await rpc('skills.checkFlow',{skill:'mine',flow:customFlow})).stat
 assert.equal((await rpc('skills.checkFlow',{skill:'mine',flow:customFlow,tools:['tools:echo']})).status,200);
 assert.equal((await rpc('skills.list')).result.skills.find(s=>s.name==='lookup').flow.title,'Lookup');
 assert.equal((await rpc('skills.list')).result.skills.some(s=>s.name==='mine'),false);
-console.log('PASS HTTP smoke: usage, metrics, flows, background tasks, delegation, compaction, JWT, tenant/user/agent isolation, deduplication, plugin replies, guardrails, tools and tool errors, UTF-16, replay, cancellation, config version, live text and resume');
+// Acknowledgements (src/progress.rs; ti-ack: on, 3 s deadline, `waiting` after 1 s quiet). A stream opens
+// before the prompt, as Workbench's does; `watch` returns the events up to the run's end.
+const ackPath='/agents/ti-ack/agent';
+const acks=async()=>(await stats()).acks;
+async function watch(session,input,params={},stop=e=>e.type==='run.finished'){
+ let opened;const ready=new Promise(r=>opened=r);
+ const events=follow(session,{path:ackPath,stop:(e,all)=>{if(e.type==='snapshot')opened();return stop(e,all);}});
+ await ready;
+ const r=await rpc('session.prompt',{input,requestId:randomUUID(),wait:false,...params},session,alice,ackPath);assert.equal(r.status,200,JSON.stringify(r));
+ return {events:await events,result:r.result};
+}
+const working=events=>events.filter(e=>e.type==='progress'&&e.phase==='working');
+// Shown ahead of the answer, for its submission, then cleared before the run ends; never in history; tokens counted.
+const acked=await create(alice,ackPath);
+const ackFirst=await watch(acked,'hold ack this');
+const ackShown=working(ackFirst.events);assert.equal(ackShown.length,1,JSON.stringify(ackFirst.events.map(e=>e.type)));
+assert.equal(ackShown[0].text,'Looking into: hold ack this');assert.deepEqual(ackShown[0].submissionIds,[ackFirst.result.submissionId]);
+const ackOrder=t=>ackFirst.events.findIndex(t);
+assert.ok(ackOrder(e=>e.type==='progress'&&e.phase==='working')<ackOrder(e=>e.type==='text.delta'),'acknowledged before the answer');
+assert.ok(ackOrder(e=>e.type==='progress'&&e.phase==='finished')<ackOrder(e=>e.type==='run.finished'),'cleared before the run ends');
+const firstAck=(await acks()).at(-1);
+assert.equal(firstAck.reasoning,null,"thinking off");assert.equal(firstAck.maxTokens,60);assert.equal(firstAck.tools,0);assert.equal(firstAck.previous,false);assert.equal(firstAck.session,acked);
+assert.ok((await rpc('session.messages',{},acked,alice,ackPath)).result.messages.every(m=>!String(m.text).includes('Looking into')));
+assert.equal(Object.values((await rpc('session.get',{},acked,alice,ackPath)).result.usage.models)[0].totalTokens,25,'the answer\'s 15 and the acknowledgement\'s 10');
+// The next one reads the previous reply, so "yes, go ahead" makes sense.
+await watch(acked,'say go ahead');assert.equal((await acks()).at(-1).previous,true);
+// Nothing for a greeting, for an acknowledgement slower than the answer, or for one that fails.
+for(const input of ['hi there','ack late','ack fail']){
+ const before=(await acks()).length;const run=await watch(await create(alice,ackPath),input);
+ assert.equal(working(run.events).length,0,input);assert.equal((await acks()).length,before+1,input);
+}
+// None when nobody is watching, when the prompt asks for none, or when the profile turns it off.
+{
+ const before=(await acks()).length;
+ const unwatched=await create(alice,ackPath);
+ assert.equal((await rpc('session.prompt',{input:'say unseen',requestId:randomUUID(),wait:false},unwatched,alice,ackPath)).status,200);
+ // Polled, not followed: a stream opened now could count as watching the run.
+ for(let i=0;i<200&&!(await rpc('session.messages',{},unwatched,alice,ackPath)).result.messages.some(m=>m.role==='assistant');i++)await sleep(25);
+ assert.equal(working((await watch(await create(alice,ackPath),'say asked for none',{progress:false})).events).length,0);
+ const quietSession=(await rpc('session.create',{profile:'quiet'},undefined,alice,ackPath)).result.sessionId;
+ assert.equal(working((await watch(quietSession,'say quiet profile')).events).length,0);
+ assert.equal((await acks()).length,before,'no acknowledgement requested: '+JSON.stringify((await acks()).slice(before).map(a=>a.said)));
+}
+// A client that will open the stream next (Workbench's first message) says `progress: true`: acknowledged before anyone follows.
+{
+ const fresh=await create(alice,ackPath);
+ const r=await rpc('session.prompt',{input:'hold first message',requestId:randomUUID(),wait:false,progress:true},fresh,alice,ackPath);assert.equal(r.status,200,JSON.stringify(r));
+ const later=await follow(fresh,{cursor:`${fresh}:0`,path:ackPath});
+ assert.equal(working(later)[0]?.text,'Looking into: hold first message',JSON.stringify(later.map(e=>e.type)));
+}
+// A quiet run sends `waiting` once, still carrying the acknowledgement; a fresh stream's snapshot has it.
+{
+ const paused=await create(alice,ackPath);
+ const run=watch(paused,'pause ack wait');
+ for(let i=0;i<40&&!(await acks()).some(a=>a.session===paused);i++)await sleep(25);
+ await sleep(300);
+ const snapshot=(await follow(paused,{path:ackPath,stop:e=>e.type==='snapshot'}))[0];
+ assert.equal(snapshot.busy,true);assert.equal(snapshot.progress?.text,'Looking into: pause ack wait',JSON.stringify(snapshot));
+ const {events}=await run;
+ const waiting=events.filter(e=>e.type==='progress'&&e.phase==='waiting');
+ assert.equal(waiting.length,1,JSON.stringify(events.map(e=>[e.type,e.phase])));assert.equal(waiting[0].text,'Looking into: pause ack wait');
+ assert.equal((await follow(paused,{path:ackPath,stop:e=>e.type==='snapshot'}))[0].progress,undefined,'gone once the run ended');
+}
+// A message steered into the running turn is acknowledged too, under both submissions.
+{
+ const steering=await create(alice,ackPath);
+ let base;
+ const run=watch(steering,'pause ack steer',{},(e,all)=>e.type==='run.finished'&&all.filter(v=>v.type==='run.finished').length===2);
+ for(let i=0;i<40&&!(await acks()).some(a=>a.session===steering);i++)await sleep(25);
+ await sleep(200);
+ const steered=await rpc('session.prompt',{input:'also this',requestId:randomUUID(),wait:false,whenBusy:'steer'},steering,alice,ackPath);assert.equal(steered.status,200,JSON.stringify(steered));
+ const {events}=await run;
+ const steerAck=working(events).find(e=>e.text==='Looking into: also this');
+ assert.ok(steerAck,JSON.stringify(working(events)));assert.equal(steerAck.submissionIds.length,2);assert.ok(steerAck.submissionIds.includes(steered.result.submissionId));
+ assert.equal((await acks()).find(a=>a.session===steering&&a.said==='also this').steered,true);
+}
+const ackMetrics=await(await fetch(base+'/metrics')).text();
+for(const outcome of ['shown','empty','late','failed','skipped'])assert.match(ackMetrics,new RegExp(`agent_ti_progress_total\\{agent="ti-ack",outcome="${outcome}"\\}`),outcome);
+console.log('PASS HTTP smoke: usage, metrics, acknowledgements, flows, background tasks, delegation, compaction, JWT, tenant/user/agent isolation, deduplication, plugin replies, guardrails, tools and tool errors, UTF-16, replay, cancellation, config version, live text and resume');

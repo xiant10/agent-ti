@@ -86,6 +86,8 @@ pub struct Work {
     pub scope: UserScope,
     pub session_id: String,
     pub command_id: String,
+    /// The submission ID clients know the command by (`Admission::ordinal`).
+    pub ordinal: i64,
     pub turn_id: String,
     pub input: String,
     pub profile: String,
@@ -128,6 +130,8 @@ pub struct TranscriptEntry {
     pub status: String,
     /// When it was written, in Unix milliseconds; none for messages from before times were kept.
     pub created_at: Option<i64>,
+    /// On a command's first message: what its model calls and acknowledgement spent, input and output.
+    pub turn_spent: Option<(u64, u64)>,
 }
 #[derive(Clone, Debug)]
 pub struct TranscriptPage {

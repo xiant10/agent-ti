@@ -1424,6 +1424,7 @@ async fn process(host: Arc<Host>, agent: Arc<Agent>, work: Work, token: Cancella
         done("completed", vec![answer], None, (0, 0))
     } else {
         let streamed = Arc::new(Mutex::new(Streamed::default()));
+        let ack = crate::progress::Ack::begin(&host, &agent, &work);
         let mut completion = tokio::select! {
             result = run_compacting(host.clone(), agent.clone(), work.clone(), streamed.clone()) => match result {
                 Ok(r) => done("completed", r.messages, None, (r.input_tokens, r.output_tokens)),
@@ -1434,6 +1435,11 @@ async fn process(host: Arc<Host>, agent: Arc<Agent>, work: Work, token: Cancella
             },
             _ = token.cancelled() => done("cancelled", vec![], None, (0, 0)),
         };
+        if let Some(ack) = ack {
+            let (input, output) = ack.finish().await;
+            completion.input_tokens += input;
+            completion.output_tokens += output;
+        }
         let streamed = std::mem::take(&mut *streamed.lock().unwrap());
         completion.message_id = streamed.message_id;
         completion.partial = Some(streamed.text);

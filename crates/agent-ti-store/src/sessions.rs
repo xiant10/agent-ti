@@ -357,7 +357,7 @@ impl AgentStore {
         owned(&mut conn, s, id).await?;
         let limit = limit.clamp(1, 100) as usize;
         // Messages no command wrote (a plugin's history, a task's note) have no turn.
-        let rows=sqlx::query("SELECT m.sequence,m.payload,COALESCE(c.turn_id,''),COALESCE(c.request_key,''),COALESCE(c.status,'completed'),m.created_at FROM messages m LEFT JOIN commands c USING(tenant_id,agent_id,session_id,command_id) WHERE m.tenant_id=? AND m.agent_id=? AND m.session_id=? AND m.sequence<? AND json_extract(m.payload,'$.role')<>'record' ORDER BY m.sequence DESC LIMIT ?")
+        let rows=sqlx::query("SELECT m.sequence,m.payload,COALESCE(c.turn_id,''),COALESCE(c.request_key,''),COALESCE(c.status,'completed'),m.created_at,CASE WHEN m.position=0 THEN c.input_tokens END,CASE WHEN m.position=0 THEN c.output_tokens END FROM messages m LEFT JOIN commands c USING(tenant_id,agent_id,session_id,command_id) WHERE m.tenant_id=? AND m.agent_id=? AND m.session_id=? AND m.sequence<? AND json_extract(m.payload,'$.role')<>'record' ORDER BY m.sequence DESC LIMIT ?")
             .bind(&s.tenant_id).bind(&s.agent_id).bind(id).bind(before).bind((limit+1) as i64).fetch_all(&mut *conn).await.map_err(db)?;
         let has_more = rows.len() > limit;
         let mut entries = rows
@@ -371,6 +371,10 @@ impl AgentStore {
                     request_id: r.get(3),
                     status: r.get(4),
                     created_at: r.get(5),
+                    turn_spent: r
+                        .get::<Option<i64>, _>(6)
+                        .zip(r.get::<Option<i64>, _>(7))
+                        .map(|(i, o)| (i as u64, o as u64)),
                 })
             })
             .collect::<StoreResult<Vec<_>>>()?;
@@ -994,6 +998,7 @@ impl AgentStore {
             },
             session_id: row.get("session_id"),
             command_id: row.get("command_id"),
+            ordinal: row.get("ordinal"),
             turn_id: row.get("turn_id"),
             input: row.get("input"),
             profile: row.get("profile"),
@@ -1134,7 +1139,9 @@ impl AgentStore {
         sqlx::query("UPDATE steps SET result=? WHERE tenant_id=? AND agent_id=? AND session_id=? AND command_id=? AND operation_id=? AND result IS NULL")
             .bind(encoded).bind(&w.scope.tenant_id).bind(&w.scope.agent_id).bind(&w.session_id).bind(&w.command_id).bind(id)
             .execute(&mut *tx).await.map_err(db)?.rows_affected().eq(&1).then_some(()).ok_or(StoreError::Conflict)?;
-        sqlx::query("UPDATE commands SET stalls=0 WHERE command_id=?")
+        sqlx::query("UPDATE commands SET stalls=0,input_tokens=input_tokens+?,output_tokens=output_tokens+? WHERE command_id=?")
+            .bind(input as i64)
+            .bind(output as i64)
             .bind(&w.command_id)
             .execute(&mut *tx)
             .await

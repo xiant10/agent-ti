@@ -12,6 +12,6 @@
     "requiredScopes": "agent:use"
   },
   "limits": { "maxConcurrentRuns": 8, "maxStreams": 64 },
-  "agents": "${AGENTS_DIR:-/etc/agent-ti/agents}/ti-demo/agent.json, ${AGENTS_DIR:-/etc/agent-ti/agents}/ti-plain/agent.json",
+  "agents": "${AGENTS_DIR:-/etc/agent-ti/agents}/ti-demo/agent.json, ${AGENTS_DIR:-/etc/agent-ti/agents}/ti-plain/agent.json, ${AGENTS_DIR:-/etc/agent-ti/agents}/ti-ack/agent.json",
   "defaultAgent": "ti-demo"
 }

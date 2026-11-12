@@ -69,6 +69,8 @@ pub struct Agent {
     pub children: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     /// Sessions with a background compaction running.
     pub compacting: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Runs being acknowledged, and turns that asked for no acknowledgement (`src/progress.rs`).
+    pub acks: crate::progress::Acks,
     catalog: RwLock<Catalog>,
 }
 fn pattern(glob: &str, text: &str) -> bool {
@@ -455,6 +457,7 @@ impl Agent {
             tenant_config,
             turn_pins,
             compacting: Default::default(),
+            acks: Default::default(),
             children: Default::default(),
             task_wake: Default::default(),
             config,

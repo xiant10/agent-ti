@@ -123,6 +123,30 @@ pub struct ProfileConfig {
     pub expert: Option<ExpertConfig>,
     /// `wake`: a background task's report starts a run. `note`: it waits for the next user input.
     pub task_reports: String,
+    /// Acknowledgements while a run starts (`docs/progress.md`); `None` is off.
+    pub progress: Option<Progress>,
+}
+/// How a profile acknowledges a request: the agent's `progress` block (or agent-pi's
+/// `progressModel`) with the profile's own `progress` over it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Progress {
+    /// A name in `models`: the agent's choice, else the profile's model. Thinking is always off.
+    pub model: String,
+    /// An acknowledgement later than this is dropped.
+    pub timeout_ms: u64,
+    /// Quiet time before a `waiting` event; 0 sends none.
+    pub waiting_after_ms: u64,
+    /// Acknowledge a message steered into a running turn.
+    pub steer: bool,
+}
+/// A `progress` block as read, before the profile's model fills in a missing `model`.
+#[derive(Clone, Debug)]
+struct ProgressDraft {
+    enabled: bool,
+    model: Option<String>,
+    timeout_ms: u64,
+    waiting_after_ms: u64,
+    steer: bool,
 }
 #[derive(Clone, Debug)]
 pub struct ExpertConfig {
@@ -250,6 +274,7 @@ const TOP: &[&str] = &[
     "grants",
     "models",
     "profiles",
+    "progress",
     "progressModel",
     "defaultProfile",
     "subagents",
@@ -318,7 +343,9 @@ const PROFILE: &[&str] = &[
     "thinkingEvents",
     "taskReports",
     "expert",
+    "progress",
 ];
+const PROGRESS: &[&str] = &["enabled", "model", "timeoutMs", "waitingAfterMs", "steer"];
 const MCP: &[&str] = &[
     "name",
     "transport",
@@ -394,6 +421,57 @@ fn owned_tool(s: &str) -> bool {
         && tool
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// A `progress` setting over `base`: `true` or `false` switches it, an object changes the fields it
+/// names.
+fn progress_draft(
+    r: &Reader,
+    value: Option<&Value>,
+    at: &str,
+    base: &ProgressDraft,
+    model_name: &dyn Fn(Option<&Value>, &str) -> Result<String>,
+) -> Result<ProgressDraft> {
+    let o = match value {
+        None => return Ok(base.clone()),
+        Some(Value::Bool(_) | Value::String(_)) => {
+            return Ok(ProgressDraft {
+                enabled: r.boolean(value, at, base.enabled)?,
+                ..base.clone()
+            });
+        }
+        Some(v) => r.object(v, at, PROGRESS)?,
+    };
+    let timeout_ms = r.count(
+        o.get("timeoutMs"),
+        &format!("{at}.timeoutMs"),
+        base.timeout_ms,
+    )?;
+    if !(1_000..=15_000).contains(&timeout_ms) {
+        return r.fail(&format!("{at}.timeoutMs"), "must be 1000 to 15000");
+    }
+    let waiting_after_ms = r.count(
+        o.get("waitingAfterMs"),
+        &format!("{at}.waitingAfterMs"),
+        base.waiting_after_ms,
+    )?;
+    if waiting_after_ms != 0 && !(1_000..=600_000).contains(&waiting_after_ms) {
+        return r.fail(
+            &format!("{at}.waitingAfterMs"),
+            "must be 0, or 1000 to 600000",
+        );
+    }
+    Ok(ProgressDraft {
+        enabled: r.boolean(o.get("enabled"), &format!("{at}.enabled"), base.enabled)?,
+        model: match o.get("model") {
+            Some(Value::String(s)) if s.is_empty() => base.model.clone(),
+            Some(m) => Some(model_name(Some(m), &format!("{at}.model"))?),
+            None => base.model.clone(),
+        },
+        timeout_ms,
+        waiting_after_ms,
+        steer: r.boolean(o.get("steer"), &format!("{at}.steer"), base.steer)?,
+    })
 }
 
 /// Reads the agent file of `snapshot`, and the files it names, through the snapshot.
@@ -476,6 +554,24 @@ pub fn load_agent(
         Ok(name)
     };
 
+    // agent-pi's `progressModel` is shorthand for a `progress` block naming that model.
+    let shorthand = r.optional_string(top.get("progressModel"), "progressModel")?;
+    if let Some(name) = &shorthand {
+        model_name(Some(&Value::String(name.clone())), "progressModel")?;
+    }
+    let base_progress = progress_draft(
+        &r,
+        top.get("progress"),
+        "progress",
+        &ProgressDraft {
+            enabled: shorthand.is_some(),
+            model: shorthand,
+            timeout_ms: 5_000,
+            waiting_after_ms: 15_000,
+            steer: true,
+        },
+        &model_name,
+    )?;
     let mut profiles = BTreeMap::new();
     for (name, value) in r.map(top.get("profiles"), "profiles")? {
         let at = format!("profiles.{name}");
@@ -512,8 +608,22 @@ pub fn load_agent(
             Some(file) => Some(text(&file, &format!("{at}.instructionsFile"))?),
             None => None,
         };
+        let model = model_name(p.get("model"), &format!("{at}.model"))?;
+        let progress = progress_draft(
+            &r,
+            p.get("progress"),
+            &format!("{at}.progress"),
+            &base_progress,
+            &model_name,
+        )?;
         let profile = ProfileConfig {
-            model: model_name(p.get("model"), &format!("{at}.model"))?,
+            progress: progress.enabled.then(|| Progress {
+                model: progress.model.unwrap_or_else(|| model.clone()),
+                timeout_ms: progress.timeout_ms,
+                waiting_after_ms: progress.waiting_after_ms,
+                steer: progress.steer,
+            }),
+            model,
             thinking_level: r.one_of(
                 p.get("thinkingLevel"),
                 &format!("{at}.thinkingLevel"),
@@ -550,10 +660,6 @@ pub fn load_agent(
             task_reports,
         };
         profiles.insert(name.clone(), profile);
-    }
-    if let Some(progress) = r.optional_string(top.get("progressModel"), "progressModel")? {
-        model_name(Some(&Value::String(progress)), "progressModel")?;
-        note("progressModel", "progress events");
     }
     let default_profile = r
         .optional_string(top.get("defaultProfile"), "defaultProfile")?

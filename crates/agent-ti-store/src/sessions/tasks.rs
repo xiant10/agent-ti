@@ -532,6 +532,19 @@ impl AgentStore {
                 .collect(),
         })
     }
+    /// Tokens a run spent outside its steps, such as its acknowledgement (`src/progress.rs`), counted
+    /// to its session and its command.
+    pub async fn add_spent(&self, w: &Work, input: u64, output: u64) -> StoreResult<()> {
+        let s = &w.scope;
+        let mut conn = self.begin().await?;
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await.map_err(db)?;
+        sqlx::query("UPDATE sessions SET input_tokens=input_tokens+?,output_tokens=output_tokens+? WHERE tenant_id=? AND agent_id=? AND session_id=?")
+            .bind(input as i64).bind(output as i64).bind(&s.tenant_id).bind(&s.agent_id).bind(&w.session_id).execute(&mut *tx).await.map_err(db)?;
+        sqlx::query("UPDATE commands SET input_tokens=input_tokens+?,output_tokens=output_tokens+? WHERE command_id=?")
+            .bind(input as i64).bind(output as i64).bind(&w.command_id).execute(&mut *tx).await.map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(())
+    }
     /// A user spoke in the session: idle tasks' reply clocks start, and unattended runs reset.
     pub async fn tasks_heard(&self, s: &UserScope, session_id: &str) -> StoreResult<()> {
         sqlx::query("UPDATE tasks SET heard_at=? WHERE tenant_id=? AND agent_id=? AND session_id=? AND status IN ('idle','failed') AND heard_at IS NULL")

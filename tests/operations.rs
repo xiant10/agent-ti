@@ -421,3 +421,41 @@ async fn a_run_that_ends_badly_keeps_what_it_spent_and_a_replay_adds_nothing() {
     store.finish(&work, failed).await.unwrap();
     assert_eq!(store.usage(&a, id).await.unwrap().own, (100, 50));
 }
+
+#[tokio::test]
+async fn each_turn_reports_what_it_spent_on_its_first_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("assistant.sqlite")).await;
+    let a = scope("alice");
+    let id = "assistant.r0.turns";
+    exchange(&store, &a, id, (100, 50)).await;
+    store.admit(submit(&a, id, "second")).await.unwrap();
+    let next = store
+        .runnable(10)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let work = store.claim(&next.command_id).await.unwrap().unwrap();
+    spend(&store, &work, (30, 20)).await;
+    // An acknowledgement's tokens count toward its turn too.
+    store.add_spent(&work, 5, 1).await.unwrap();
+    store.finish(&work, done((35, 21))).await.unwrap();
+    let page = store.transcript(&a, id, i64::MAX, 100).await.unwrap();
+    let spent: Vec<_> = page
+        .entries
+        .iter()
+        .map(|e| (e.message.role.as_str(), e.turn_spent))
+        .collect();
+    assert_eq!(
+        spent,
+        [
+            ("user", Some((100, 50))),
+            ("assistant", None),
+            ("user", Some((35, 21))),
+            ("assistant", None),
+        ]
+    );
+    assert_eq!(store.usage(&a, id).await.unwrap().own, (135, 71));
+}

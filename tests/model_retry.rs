@@ -90,6 +90,7 @@ async fn run(
         },
         session_id: "s".into(),
         command_id: "c".into(),
+        ordinal: 1,
         turn_id: "turn".into(),
         input: "hi".into(),
         profile: "chat".into(),

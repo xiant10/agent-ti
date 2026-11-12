@@ -1,0 +1,19 @@
+{
+  "agent": "ti-ack",
+  "models": {
+    "chat": {
+      "provider": "openai-compatible",
+      "modelId": "scripted",
+      "baseUrl": "${FIXTURE_URL:-http://agent-ti-fixture:8080}/v1",
+      "identityHeaders": "gateway",
+      "maxOutputTokens": 256
+    }
+  },
+  "progress": { "enabled": true, "timeoutMs": 3000, "waitingAfterMs": 1000 },
+  "profiles": {
+    "chat": { "model": "chat", "maxActiveTools": 0 },
+    "quiet": { "model": "chat", "maxActiveTools": 0, "progress": false }
+  },
+  "instructions": [{ "name": "base", "file": "base.md", "tag": false }],
+  "limits": { "maxSessionsPerUser": 100000 }
+}

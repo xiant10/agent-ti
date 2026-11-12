@@ -7,6 +7,8 @@ const b64=v=>Buffer.from(JSON.stringify(v)).toString('base64url');
 let modelCalls=0,toolCalls=0,summaries=0;
 const tools={};
 const requests=[];
+// Acknowledgement requests (src/progress.rs), kept apart so the counts above stay the run's.
+const acks=[];
 const server=createServer(async(req,res)=>{
  try {
     const url=new URL(req.url,'http://fixture');
@@ -19,7 +21,7 @@ const server=createServer(async(req,res)=>{
       const input=`${b64({alg:'ES256',kid:'fixture',typ:'JWT'})}.${b64(payload)}`;
       return json({token:input+'.'+sign('sha256',Buffer.from(input),{key:keys.privateKey,dsaEncoding:'ieee-p1363'}).toString('base64url')});
     }
-    if(url.pathname==='/stats')return json({modelCalls,toolCalls,tools,requests,summaries});
+    if(url.pathname==='/stats')return json({modelCalls,toolCalls,tools,requests,summaries,acks});
     const chunks=[];let size=0;
     for await(const chunk of req){size+=chunk.length;if(size>1024*1024){res.writeHead(413).end();return;}chunks.push(chunk);}
     const body=JSON.parse(Buffer.concat(chunks).toString());
@@ -36,6 +38,16 @@ const server=createServer(async(req,res)=>{
       return json({jsonrpc:'2.0',id:body.id,result:{protocolVersion:'2025-03-26',capabilities:{tools:{}},serverInfo:{name:'fixture',version:'1'}}});
     }
     if(url.pathname!=='/v1/chat/completions'){res.writeHead(404).end();return;}
+    // An acknowledgement: "Looking into: <message>", nothing for a greeting, late for "ack late", a 500 for "ack fail".
+    if(String(body.messages[0]?.content??'').startsWith('You write the one-line status')){
+      const prompt=String(body.messages.at(-1)?.content??'');const said=prompt.match(/<message>\n([\s\S]*)\n<\/message>/)?.[1]??'';
+      acks.push({said,previous:prompt.includes('<previous_reply>'),steered:prompt.startsWith('The person sent this'),thinking:body.enable_thinking,reasoning:body.reasoning_effort??null,maxTokens:body.max_tokens,tools:body.tools?.length??0,session:req.headers['x-session-id']});
+      if(said.includes('ack fail')){res.writeHead(500).end();return;}
+      if(said.includes('ack late')){await new Promise(r=>setTimeout(r,1500));if(res.destroyed)return;}
+      res.writeHead(200,{'content-type':'text/event-stream'});
+      res.write('data: '+JSON.stringify({choices:[{index:0,delta:{content:said.startsWith('hi')?'-':`"Looking into: ${said}"`},finish_reason:null}]})+'\n\n');
+      res.write('data: '+JSON.stringify({choices:[{index:0,delta:{},finish_reason:'stop'}],usage:{prompt_tokens:7,completion_tokens:3}})+'\n\n');return res.end('data: [DONE]\n\n');
+    }
     modelCalls++;
     const send0=(text)=>{res.writeHead(200,{'content-type':'text/event-stream'});res.write('data: '+JSON.stringify({choices:[{index:0,delta:{content:text},finish_reason:null}]})+'\n\n');res.write('data: '+JSON.stringify({choices:[{index:0,delta:{},finish_reason:'stop'}]})+'\n\n');res.end('data: [DONE]\n\n');};
     // A compaction's summarizer request: answered with a short summary that names what it read.
@@ -61,6 +73,7 @@ const server=createServer(async(req,res)=>{
       for(const word of ['one ','two ','three ','four ','five ','six ','seven ','eight ','nine ','ten 😀']){send({content:word});await new Promise(r=>setTimeout(r,150));if(res.destroyed)return;}
     }else{
       if(input.startsWith('hold')){await new Promise(r=>setTimeout(r,1000));if(res.destroyed)return;}
+      if(input.startsWith('pause')){await new Promise(r=>setTimeout(r,2500));if(res.destroyed)return;}
       if(input.startsWith('slow')){await new Promise(r=>setTimeout(r,5000));if(res.destroyed)return;}
       send({content:input.startsWith('slow')?'recovered after restart':input.replace(/^say /,'')+' 😀é'});
     }

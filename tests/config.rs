@@ -514,3 +514,78 @@ fn sub_agents_and_the_expert_follow_agent_pi() {
     .to_string();
     assert!(error.contains("subagents.x.model"), "{error}");
 }
+#[test]
+fn acknowledgements_are_set_for_the_agent_and_changed_per_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let load = |text: &str, vars: &[(&str, &str)]| {
+        write(dir.path(), &[("ti/agent.json", text), ("ti/base.md", "x")]);
+        load_agent(
+            &FileSource::snapshot(&dir.path().join("ti/agent.json")).unwrap(),
+            &env(vars),
+        )
+    };
+    let with = |top: &str, chat: &str| {
+        MINIMAL
+            .replace("\"agent\": \"ti\",", &format!("\"agent\": \"ti\", {top}"))
+            .replace(
+                "\"maxActiveTools\": \"${TOOLS:-8}\"}",
+                &format!("\"maxActiveTools\": 8{chat}}}, \"voice\": {{\"model\": \"chat\"}}"),
+            )
+    };
+    // Off unless asked for.
+    let config = load(MINIMAL, &[]).unwrap();
+    assert_eq!(config.profiles["chat"].progress, None);
+    // agent-pi's shorthand turns it on with that model, and is no longer unported.
+    let config = load(&with("\"progressModel\": \"chat\",", ""), &[]).unwrap();
+    let progress = config.profiles["voice"].progress.clone().unwrap();
+    assert_eq!(
+        (
+            progress.model.as_str(),
+            progress.timeout_ms,
+            progress.waiting_after_ms,
+            progress.steer
+        ),
+        ("chat", 5_000, 15_000, true)
+    );
+    assert!(config.unported.is_empty(), "{:?}", config.unported);
+    // The agent's block, with a profile switching it off and an environment variable for operators.
+    let block = "\"progress\": {\"enabled\": \"${ACKS:-true}\", \"waitingAfterMs\": 7000},";
+    let config = load(&with(block, ", \"progress\": false"), &[]).unwrap();
+    assert_eq!(config.profiles["chat"].progress, None);
+    let voice = config.profiles["voice"].progress.clone().unwrap();
+    assert_eq!(
+        (voice.model.as_str(), voice.waiting_after_ms),
+        ("chat", 7_000)
+    );
+    let config = load(&with(block, ""), &[("ACKS", "false")]).unwrap();
+    assert!(config.profiles.values().all(|p| p.progress.is_none()));
+    // A profile changes only what it names.
+    let config = load(
+        &with(
+            block,
+            ", \"progress\": {\"timeoutMs\": 2000, \"steer\": false}",
+        ),
+        &[],
+    )
+    .unwrap();
+    let chat = config.profiles["chat"].progress.clone().unwrap();
+    assert_eq!(
+        (chat.timeout_ms, chat.waiting_after_ms, chat.steer),
+        (2_000, 7_000, false)
+    );
+    // Out of range or unknown, it stops startup.
+    for (bad, field) in [
+        (
+            "\"progress\": {\"enabled\": true, \"timeoutMs\": 60000},",
+            "progress.timeoutMs",
+        ),
+        (
+            "\"progress\": {\"enabled\": true, \"model\": \"nope\"},",
+            "progress.model",
+        ),
+        ("\"progress\": {\"enabld\": true},", "enabld"),
+    ] {
+        let error = load(&with(bad, ""), &[]).unwrap_err().to_string();
+        assert!(error.contains(field), "{error}");
+    }
+}

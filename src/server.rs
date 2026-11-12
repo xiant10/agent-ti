@@ -157,7 +157,7 @@ const NOTE_CLOSE: &str = "</turn-note>\n\n";
 fn with_note(input: &str, note: &str) -> String {
     format!("{NOTE_OPEN}{note}{NOTE_CLOSE}{input}")
 }
-fn without_note(text: &str) -> &str {
+pub(crate) fn without_note(text: &str) -> &str {
     text.strip_prefix(NOTE_OPEN)
         .and_then(|rest| rest.split_once(NOTE_CLOSE))
         .map_or(text, |(_, input)| input)
@@ -647,6 +647,19 @@ async fn prompt(
     let traceparent = header(headers, "traceparent")
         .filter(|t| t.len() == 55 && t.bytes().all(|c| c.is_ascii_hexdigit() || c == b'-'))
         .map(str::to_owned);
+    // Acknowledgements (`src/progress.rs`) are for someone watching: a prompt that streams its own
+    // events is, before its stream opens, as is one that says `progress: true` because its client
+    // opens the session's stream next (Workbench's first message). One that asks for none gets none.
+    let streams = params.get("stream") != Some(&json!(false))
+        && header(headers, "accept").is_some_and(|a| a.contains("text/event-stream"));
+    if streams || params.get("progress") == Some(&json!(true)) {
+        agent.hub.expect_watcher(session_id, session_state.high_water);
+    }
+    let acknowledge = params.get("progress") != Some(&json!(false));
+    if !acknowledge {
+        agent.acks.quiet(&turn_id);
+    }
+    let steered = (when_busy.as_deref() == Some("steer") && acknowledge).then(|| text.clone());
     let submit = Submit {
         scope: s.clone(),
         session_id: session_id.into(),
@@ -685,6 +698,9 @@ async fn prompt(
             plugin.after_run(&info);
         }
     } else if !admission.duplicate {
+        if let Some(input) = steered {
+            agent.acks.steered(session_id, &input, admission.ordinal);
+        }
         host.scheduler.wake();
     }
     Ok(admitted(admission))
@@ -1065,6 +1081,10 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
                             return line;
                         }
                         if e.message.role == "user" {
+                            // What the turn this message started spent.
+                            if let Some(spent) = e.turn_spent {
+                                value["usage"] = usage_value(spent);
+                            }
                             value["text"] = json!(without_note(&e.message.content));
                             value["turnId"] = json!(e.turn_id);
                             value["requestId"] = json!(e.request_id);
@@ -1415,7 +1435,7 @@ async fn open_event_stream(
     let session_id_header = id.clone();
     let stream = async_stream::stream! {
         let _permit = permit;
-        let Subscription { mut rx, position, high_water, partial, deltas } = sub;
+        let Subscription { mut rx, position, high_water, partial, progress, deltas } = sub;
         let mut last = position;
         match (cursor, deltas) {
             // Resume exactly: committed events from the store up to the hub's high-water mark,
@@ -1455,6 +1475,9 @@ async fn open_event_stream(
                 let mut payload = json!({"type":"snapshot","session":session_value(state.session),"busy":busy,"highWater":high_water,"partialText":partial.as_ref().map_or("", |p| p.text.as_str()),"inbox":[],"tasks":tasks});
                 if let Some(partial) = &partial {
                     payload["partial"] = partial.value();
+                }
+                if busy && let Some(progress) = &progress {
+                    payload["progress"] = progress.clone();
                 }
                 if let Ok(Some(flow)) = agent.store.flow(&s, &id).await {
                     payload["flow"] = flow;

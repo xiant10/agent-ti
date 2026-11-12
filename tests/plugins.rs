@@ -177,6 +177,7 @@ async fn before_prompt_answers_without_model_and_model_sees_exchange_in_next_tur
         scope: scope.clone(),
         session_id: session.session_id.clone(),
         command_id: "cmd2".into(),
+        ordinal: 2,
         turn_id: "turn2".into(),
         input: "Weekends too?".into(),
         profile: "chat".into(),

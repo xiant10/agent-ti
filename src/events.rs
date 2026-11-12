@@ -3,6 +3,8 @@
 //! last committed event's sequence plus its index after it, `<session>:<seq>.<n>`. `speech`
 //! events are deltas too: a session whose profile speaks cuts its text into sentences here, as
 //! agent-pi's event mapper does, flushed before `tool.started`, `message.end` and `run.finished`.
+//! The hub also keeps what an acknowledgement needs (`src/progress.rs`): the run's latest
+//! `progress`, for snapshots, and when the user last saw something new.
 use crate::speech::SpeechSegmenter;
 use agent_ti_store::DurableEvent;
 use serde_json::{Value, json};
@@ -11,7 +13,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 
 /// Deltas a session keeps for resuming, by count and by bytes.
 const RING_EVENTS: usize = 1024;
@@ -20,6 +22,8 @@ const RING_BYTES: usize = 1024 * 1024;
 const IDLE: Duration = Duration::from_secs(60);
 /// A subscriber this far behind is disconnected and resumes from its cursor.
 const CHANNEL: usize = 1024;
+/// How long a prompt that will stream its own events counts as watched before its stream opens.
+const EXPECTED: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EventId {
@@ -75,6 +79,16 @@ struct Live {
     partial: Option<Partial>,
     speech: Option<Speech>,
     active: Instant,
+    /// The run whose `progress` this is, and the event, until that run finishes.
+    progress: Option<(String, Value)>,
+    /// When something new last reached the user: text, a tool, a retry. Progress itself doesn't count.
+    seen: Option<Instant>,
+    /// When answer text last arrived.
+    text: Option<Instant>,
+    /// Woken when `seen` moves.
+    activity: Arc<Notify>,
+    /// A prompt said it would stream this session's events, until then.
+    expected: Option<Instant>,
 }
 /// A speaking session's segmenter, and the message whose text it has been fed.
 #[derive(Default)]
@@ -95,7 +109,21 @@ impl Live {
             partial: None,
             speech: None,
             active: Instant::now(),
+            progress: None,
+            seen: None,
+            text: None,
+            activity: Arc::new(Notify::new()),
+            expected: None,
         }
+    }
+    /// Something new reached the user; `text` when it was answer text.
+    fn saw(&mut self, text: bool) {
+        let now = Instant::now();
+        self.seen = Some(now);
+        if text {
+            self.text = Some(now);
+        }
+        self.activity.notify_waiters();
     }
     /// Publishes one delta from memory, keeping it in the ring.
     fn publish(&mut self, payload: Value) -> EventId {
@@ -181,6 +209,8 @@ pub struct Subscription {
     pub position: EventId,
     pub high_water: i64,
     pub partial: Option<Partial>,
+    /// The running turn's latest `progress`, for a snapshot.
+    pub progress: Option<Value>,
     /// Deltas after the cursor, when it can resume exactly; `None` means send a snapshot.
     pub deltas: Option<Vec<Published>>,
 }
@@ -201,6 +231,19 @@ impl Hub {
                 continue;
             }
             live.speech_before(&event.payload);
+            match event.payload["type"].as_str() {
+                Some("tool.started" | "tool.finished" | "message.end") => live.saw(false),
+                Some("text.delta") => live.saw(true),
+                Some("run.finished")
+                    if live
+                        .progress
+                        .as_ref()
+                        .is_some_and(|(run, _)| event.payload["runId"] == run.as_str()) =>
+                {
+                    live.progress = None
+                }
+                _ => {}
+            }
             live.high_water = event.sequence;
             live.next_delta = 1;
             live.active = Instant::now();
@@ -262,9 +305,58 @@ impl Hub {
             }
             live.publish(payload);
             live.speak(&message, &text);
+            live.saw(true);
         } else {
+            let seen = !matches!(payload["type"].as_str(), Some("progress" | "speech"));
             live.publish(payload);
+            if seen {
+                live.saw(false);
+            }
         }
+    }
+    /// Publishes a run's `progress` and keeps it for snapshots; `finished` clears it.
+    pub fn progress(&self, session: &str, run: &str, payload: Value) {
+        let mut sessions = self.sessions.lock().unwrap();
+        let live = sessions
+            .entry(session.to_owned())
+            .or_insert_with(|| Live::new(0));
+        live.progress = (payload["phase"] != "finished").then(|| (run.to_owned(), payload.clone()));
+        live.publish(payload);
+    }
+    /// A prompt will stream this session's events: it counts as watched before its stream opens.
+    pub fn expect_watcher(&self, session: &str, stored: i64) {
+        let mut sessions = self.sessions.lock().unwrap();
+        let live = sessions
+            .entry(session.to_owned())
+            .or_insert_with(|| Live::new(stored));
+        live.expected = Some(Instant::now() + EXPECTED);
+    }
+    /// Someone follows this session, or is about to.
+    pub fn watched(&self, session: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session)
+            .is_some_and(|live| {
+                live.tx.receiver_count() > 0
+                    || live.expected.is_some_and(|until| until > Instant::now())
+            })
+    }
+    /// Woken whenever something new reaches the user of this session.
+    pub fn activity(&self, session: &str) -> Arc<Notify> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let live = sessions
+            .entry(session.to_owned())
+            .or_insert_with(|| Live::new(0));
+        live.activity.clone()
+    }
+    /// When something new last reached the user, and when answer text last arrived.
+    pub fn last_seen(&self, session: &str) -> (Option<Instant>, Option<Instant>) {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session)
+            .map_or((None, None), |live| (live.seen, live.text))
     }
     /// Subscribes to a session. `stored` is its committed high-water mark in the store, for a session
     /// with no events since this process started. With a cursor, the deltas after it are returned if
@@ -298,13 +390,17 @@ impl Hub {
             position,
             high_water: live.high_water,
             partial: live.partial.clone(),
+            progress: live.progress.as_ref().map(|(_, p)| p.clone()),
             deltas: exact.map(|c| live.ring.iter().filter(|d| d.id > c).cloned().collect()),
         }
     }
     /// Forgets sessions nobody follows that have been idle for a minute, keeping a reply in progress.
     pub fn sweep(&self) {
         self.sessions.lock().unwrap().retain(|_, live| {
-            live.tx.receiver_count() > 0 || live.partial.is_some() || live.active.elapsed() < IDLE
+            live.tx.receiver_count() > 0
+                || live.partial.is_some()
+                || live.progress.is_some()
+                || live.active.elapsed() < IDLE
         });
     }
 }
