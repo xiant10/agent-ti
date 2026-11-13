@@ -58,6 +58,9 @@ pub struct GrantBroker {
     in_flight_attach: Flights<String>,
     in_flight_mint: Flights<String>,
     in_flight_service: Flights<()>,
+    /// Each session grant's read-only child, for a greeting's tool variables.
+    read_only: Arc<RwLock<HashMap<String, String>>>,
+    in_flight_read_only: Flights<String>,
     retry_delay: Duration,
 }
 
@@ -77,6 +80,8 @@ impl GrantBroker {
             in_flight_attach: Flights::default(),
             in_flight_mint: Flights::default(),
             in_flight_service: Flights::default(),
+            read_only: Arc::new(RwLock::new(HashMap::new())),
+            in_flight_read_only: Flights::default(),
             retry_delay: Duration::from_millis(200),
         }
     }
@@ -585,6 +590,96 @@ impl GrantBroker {
         Ok(spawned)
     }
 
+    /// A token for the session's grant narrowed to reading: a child grant holding only the parent's
+    /// `*:read` actions (and `agent:use`), made once per session grant. The services that answer
+    /// enforce it with their own policy, so a context variable that names a tool which writes fails
+    /// instead of changing anything (`docs/greeting.md`).
+    pub async fn read_only_token(
+        &self,
+        store: &AgentStore,
+        session_id: &str,
+    ) -> Result<String, GrantError> {
+        let parent = self
+            .grant_of(store, session_id)
+            .await
+            .ok_or(GrantError::Stopped)?;
+        let known = self.read_only.read().await.get(&parent.grant_id).cloned();
+        if let Some(child) = known {
+            return self.mint(&child).await;
+        }
+        let flight = self.in_flight_read_only.start(&parent.grant_id).await;
+        if flight.is_none()
+            && let Some(child) = self.read_only.read().await.get(&parent.grant_id).cloned()
+        {
+            return self.mint(&child).await;
+        }
+        // The grant's own actions and audiences, not its token's: where tools go through the tool
+        // gateway, a token's audience is narrowed to the gateways, and the gateway can only
+        // exchange it for an audience the grant holds.
+        let chain = self
+            .service_get(
+                &format!("/v1/grants/{}/chain", url_encode(&parent.grant_id)),
+                REQUEST_TIMEOUT,
+            )
+            .await?;
+        let leaf = chain["chain"]
+            .as_array()
+            .and_then(|c| c.last())
+            .cloned()
+            .unwrap_or_default();
+        let held = leaf["actions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let actions = read_actions(&held);
+        if actions.is_empty() {
+            return Err(GrantError::Stopped);
+        }
+        let audiences = leaf["audiences"].clone();
+        let token = self.mint(&parent.grant_id).await?;
+        let body = json!({"subject_token": token, "actions": actions, "audiences": audiences});
+        let resp = self.service_call("/v1/grants", Some(&body), None).await?;
+        let child = resp
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| GrantError::Unavailable("the auth service returned no grant id".into()))?
+            .to_string();
+        {
+            let mut known = self.read_only.write().await;
+            if known.len() >= 10_000 {
+                known.clear();
+            }
+            known.insert(parent.grant_id.clone(), child.clone());
+        }
+        self.mint(&child).await
+    }
+
+    /// A `GET` to the auth service with this runtime's service token, such as an org lookup.
+    pub async fn service_get(&self, path: &str, timeout: Duration) -> Result<Value, GrantError> {
+        let token = self.service_token().await?;
+        let response = self
+            .client
+            .get(format!("{}{}", self.config.url, path))
+            .header("authorization", format!("Bearer {token}"))
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| GrantError::Unavailable(e.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(GrantError::Unavailable(format!(
+                "the auth service answered {status}"
+            )));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| GrantError::Unavailable(e.to_string()))
+    }
+
     /// Releases a session's grant.
     pub async fn release(&self, session_id: &str) {
         let grant = self.by_conversation.write().await.remove(session_id);
@@ -606,6 +701,14 @@ pub const MODEL_AUDIENCE: &str = "ai-gateway-llm";
 
 /// Whether a token is for the model gateway. It reads the claims without checking them: the
 /// gateway does that.
+/// The actions of a scope that only read, plus `agent:use`, which every agent token carries.
+pub fn read_actions(scope: &str) -> Vec<&str> {
+    scope
+        .split(' ')
+        .filter(|a| a.ends_with(":read") || *a == "agent:use")
+        .collect()
+}
+
 pub fn for_model_gateway(token: &str) -> bool {
     use base64::Engine;
     let Some(payload) = token.split('.').nth(1) else {

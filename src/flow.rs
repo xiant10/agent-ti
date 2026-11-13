@@ -311,7 +311,7 @@ pub fn evaluate_condition(expr: &str, context: &FlowContext) -> bool {
 }
 
 /// What later steps can read of a tool's output: `count`, `items`, `firstId`, `firstName`, ...
-fn summarize_output(raw: &str, is_error: bool) -> (Value, String) {
+pub(crate) fn summarize_output(raw: &str, is_error: bool) -> (Value, String) {
     let trimmed = raw.trim();
     let parsed = (trimmed.starts_with('{') || trimmed.starts_with('['))
         .then(|| serde_json::from_str::<Value>(raw).ok())

@@ -32,6 +32,8 @@ pub struct TenantConfig {
     pub model: Option<String>,
     /// The agent's `keepTools`, which no version turns off.
     pub keep_tools: Vec<String>,
+    /// The tenant's call greeting and context variables (`docs/greeting.md`).
+    pub greeting: agent_ti_config::TenantGreeting,
 }
 
 fn strings(value: &Value) -> Vec<String> {
@@ -63,6 +65,11 @@ impl TenantConfig {
                 .filter(|m| !m.is_empty())
                 .map(str::to_owned),
             keep_tools: keep.to_vec(),
+            // Control checks these on publish; one this harness can't use keeps the agent's.
+            greeting: agent_ti_config::greeting::tenant_greeting(content).unwrap_or_else(|e| {
+                tracing::warn!(version, error = %e, "tenant greeting not usable, keeping the agent's");
+                Default::default()
+            }),
         }
     }
 
