@@ -110,6 +110,16 @@ pub struct SessionInfo<'a> {
     pub profile: &'a str,
 }
 
+/// The caller a greeting's variables are looked up for (`docs/greeting.md`).
+pub struct VariableContext<'a> {
+    pub agent: &'a str,
+    pub session_id: &'a str,
+    pub tenant_id: &'a str,
+    pub user_id: &'a str,
+    /// The call's language, such as `zh-Hans`.
+    pub locale: &'a str,
+}
+
 pub struct RunInfo<'a> {
     pub agent: &'a str,
     pub session_id: &'a str,
@@ -163,6 +173,20 @@ pub trait Plugin: Send + Sync {
     }
     fn rpc_methods(&self) -> Vec<String> {
         vec![]
+    }
+    /// Context-variable namespaces this plugin answers, such as `property` for
+    /// `{{property.open_orders}}`. A built-in namespace or an agent's configured one isn't asked.
+    fn variable_namespaces(&self) -> Vec<String> {
+        vec![]
+    }
+    /// Values for the names asked for, all in this plugin's namespaces. A name left out has no
+    /// value. Called within the greeting's time budget, so a slow answer is dropped.
+    fn resolve_variables<'a>(
+        &'a self,
+        _ctx: &'a VariableContext<'a>,
+        _names: &'a [String],
+    ) -> BoxFuture<'a, Result<serde_json::Map<String, Value>, String>> {
+        Box::pin(async { Ok(serde_json::Map::new()) })
     }
     fn call_rpc<'a>(
         &'a self,

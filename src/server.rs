@@ -163,13 +163,14 @@ pub(crate) fn without_note(text: &str) -> &str {
         .map_or(text, |(_, input)| input)
 }
 /// What every session supports, as in agent-pi's `capabilitiesOf`.
-const CAPABILITIES: [&str; 6] = [
+const CAPABILITIES: [&str; 7] = [
     "durable_runs",
     "steer",
     "interrupt",
     "voice",
     "retry",
     "background_tasks",
+    "greeting",
 ];
 /// A spend in agent-pi's `Usage` shape. This store keeps input and output tokens only.
 fn usage_value((input, output): (u64, u64)) -> Value {
@@ -846,6 +847,17 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
                 Err(e) => fail(StatusCode::BAD_REQUEST, &e),
             };
         }
+        "variables.catalog" => {
+            let tenant = match &agent.tenant_config {
+                Some(tc) => Some(tc.for_principal(&s.tenant_id, &s.user_id).await),
+                None => None,
+            };
+            return ok(
+                r.id,
+                crate::greeting::catalog(&agent, tenant.as_deref()),
+                None,
+            );
+        }
         "skills.tools" => {
             let tools = agent.catalog_tools(&s.tenant_id).await;
             let result: Vec<Value> = tools
@@ -1225,6 +1237,38 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
                 }
             }
         }
+        "session.greet" => {
+            let params = match crate::greeting::Params::read(&r.params) {
+                Ok(params) => params,
+                Err(e) => return fail(StatusCode::BAD_REQUEST, &e),
+            };
+            let (state, _, tenant) = match turn_lookup(&agent, &s, &session_id).await {
+                Ok(found) => found,
+                Err(e) => return storage(e),
+            };
+            let traceparent = header(&headers, "traceparent").map(str::to_owned);
+            let streamed = !params.prepare
+                && !params.dry_run
+                && header(&headers, "accept").is_some_and(|a| a.contains("text/event-stream"));
+            if streamed {
+                return greet_stream(GreetCall { host: host.clone(), agent: agent.clone(), principal: p.clone(), scope: s.clone(), session_id: session_id.clone(), state, tenant, params, traceparent }, r.id);
+            }
+            let value = crate::greeting::Greeting {
+                host: &host,
+                agent: &agent,
+                principal: &p,
+                scope: &s,
+                session_id: &session_id,
+                state: &state,
+                tenant: tenant.as_deref(),
+                params: &params,
+                traceparent: traceparent.as_deref(),
+                deltas: None,
+            }
+            .run()
+            .await;
+            Ok(value)
+        }
         "session.retry" => {
             agent.store.retry(&s, &session_id).await.map(|count| {
                 host.scheduler.wake();
@@ -1308,6 +1352,57 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
         Err(e) => storage(e),
     }
 }
+/// What a streamed `session.greet` owns while it runs.
+struct GreetCall {
+    host: Arc<Host>,
+    agent: Arc<Agent>,
+    principal: Principal,
+    scope: UserScope,
+    session_id: String,
+    state: SessionState,
+    tenant: Option<Arc<crate::tenant_config::TenantConfig>>,
+    params: crate::greeting::Params,
+    traceparent: Option<String>,
+}
+
+/// `session.greet` as SSE: `greeting.delta` events as the words come, then the JSON-RPC response.
+fn greet_stream(call: GreetCall, rpc_id: Value) -> Response {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Value>();
+    let session_id = call.session_id.clone();
+    tokio::spawn(async move {
+        let value = crate::greeting::Greeting {
+            host: &call.host,
+            agent: &call.agent,
+            principal: &call.principal,
+            scope: &call.scope,
+            session_id: &call.session_id,
+            state: &call.state,
+            tenant: call.tenant.as_deref(),
+            params: &call.params,
+            traceparent: call.traceparent.as_deref(),
+            deltas: Some(tx),
+        }
+        .run()
+        .await;
+        let _ = done_tx.send(value);
+    });
+    let stream = async_stream::stream! {
+        while let Some(text) = rx.recv().await {
+            yield Ok::<_, Infallible>(Event::default().data(json!({"type":"greeting.delta","text":text}).to_string()));
+        }
+        let result = done_rx.await.unwrap_or_else(|_| json!({"skipped": "failed"}));
+        yield Ok::<_, Infallible>(Event::default().data(json!({"jsonrpc":"2.0","id":rpc_id,"result":result}).to_string()));
+    };
+    let mut resp = Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(10)))
+        .into_response();
+    if let Ok(v) = HeaderValue::from_str(&session_id) {
+        resp.headers_mut().insert("agent-session-id", v);
+    }
+    resp
+}
+
 /// `DELETE`: `session.close`, with no body and a 204.
 async fn close(host: Arc<Host>, name: Option<String>, headers: HeaderMap) -> Response {
     if header(&headers, "agent-session-id").is_none_or(str::is_empty) {

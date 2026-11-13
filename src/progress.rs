@@ -29,14 +29,15 @@ const NOTHING: &str = "-";
 
 const INSTRUCTIONS: &str = "You write the one-line status an assistant shows while it starts working on a person's message.
 
-Write one short sentence, in the same language as the person's message, saying what you will look at or do. The assistant can look things up and act for the person, so never say you can't access or do something. It may still ask the person before acting, so for anything that would create, change, send or delete something, say you'll get it ready, not that you'll do it.
+Write one short sentence, in the same language as the person's message, that names what they asked about and says you'll look into it. You don't know what the assistant can do, so never promise a result or an action such as preparing, writing, searching, booking, creating or sending something, and never say you can't. Checking or looking something up is fine.
 
 Examples:
 - \"What's on my work list?\" → I'll check your work list.
 - \"帮我看看本周的维修工单\" → 我来查一下本周的维修工单。
-- \"Add a task to call the plumber\" → I'll get that task ready.
-- \"Delete the old report\" → I'll look into removing that report.
-- \"Yes, go ahead\" → Going ahead with that.
+- \"Add a task to call the plumber\" → Let me look into adding that task.
+- \"帮我在网上搜一下这方面的资料\" → 我看看这方面的资料怎么找。
+- \"Write me a report on last month's sales\" → Let me look into that sales report.
+- \"Yes, go ahead\" → Okay, looking into it.
 
 - Do not answer the message, state results, or guess what you will find.
 - Use only what the person's message says. Do not add details, steps or options from anywhere else, including the previous reply, which is there only to make sense of a short message.

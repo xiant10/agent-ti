@@ -14,9 +14,11 @@ use thiserror::Error;
 mod agent;
 pub mod control_copy;
 pub mod flow;
+pub mod greeting;
 mod host;
 mod http;
 pub use agent::*;
+pub use greeting::{GreetingConfig, GreetingText, TenantGreeting, Trust, VariableConfig};
 pub use host::*;
 pub use http::HttpSource;
 

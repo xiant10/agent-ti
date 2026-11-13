@@ -22,6 +22,10 @@ pub struct AgentConfig {
     pub grants: Option<GrantsConfig>,
     pub limits: AgentLimits,
     pub durable: Durable,
+    /// What the agent says first on a call (`docs/greeting.md`); `None` says nothing.
+    pub greeting: Option<crate::GreetingConfig>,
+    /// Context variables backed by the agent's tools, by name.
+    pub variables: BTreeMap<String, crate::VariableConfig>,
     /// Fields accepted for agent-pi compatibility whose feature isn't ported, for startup warnings.
     pub unported: Vec<String>,
     /// Host settings present in the file; the host file's values apply.
@@ -286,6 +290,8 @@ const TOP: &[&str] = &[
     "tenantConfig",
     "mcpServers",
     "limits",
+    "greeting",
+    "variables",
     "mcpEndpoint",
     "http",
     "durable",
@@ -1151,6 +1157,15 @@ pub fn load_agent(
         retry,
     };
     let bundle = r.optional_string(top.get("bundle"), "bundle")?;
+    let variables = crate::greeting::variables(&r, top.get("variables"), "variables")?;
+    let greeting = crate::greeting::greeting(
+        &r,
+        top.get("greeting"),
+        &model_name,
+        &profiles[&default_profile].model,
+        &text,
+        &|name| variables.contains_key(name),
+    )?;
     Ok(AgentConfig {
         agent,
         bundle,
@@ -1168,6 +1183,8 @@ pub fn load_agent(
         grants: grants_config,
         limits,
         durable,
+        greeting,
+        variables,
         unported,
         host_fields,
     })

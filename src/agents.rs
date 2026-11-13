@@ -785,6 +785,52 @@ impl Agent {
         matched
     }
 
+    /// The tool a context variable names (`owner:tool`), if it's on a server that takes the
+    /// caller's grant, the only kind a read-only grant can limit: a listed MCP server or one of the
+    /// tenant's connectors. Returns the server to call and the tool's name there.
+    pub fn grant_tool(&self, pattern: &str, tenant: &str) -> Option<(McpServerConfig, String)> {
+        {
+            let catalog = self.catalog.read().unwrap();
+            for (index, (listing, _)) in catalog.servers.iter().enumerate() {
+                let server = &self.config.mcp_servers[index];
+                if !crate::variables::grant_server(server) {
+                    continue;
+                }
+                let found = listing.as_ref().and_then(|tools| {
+                    tools.iter().find(|t| {
+                        crate::catalog::pattern_matches(pattern, &server.name, &t.mcp_name, &t.name)
+                    })
+                });
+                if let Some(tool) = found {
+                    return Some((server.clone(), tool.mcp_name.clone()));
+                }
+            }
+        }
+        let tc = self.tenant_connectors.as_ref()?;
+        let known = tc.known(Some(tenant));
+        let tool = known
+            .tools
+            .iter()
+            .find(|t| crate::catalog::pattern_matches(pattern, &t.server, &t.mcp_name, &t.name))?;
+        let server = McpServerConfig {
+            name: tool.server.clone(),
+            url: format!(
+                "{}/mcp/connector/{}",
+                tc.gateway_url().trim_end_matches('/'),
+                tool.connector_id
+            ),
+            auth: McpAuth::Grant { token_header: None },
+            headers: std::collections::BTreeMap::new(),
+            include: vec![],
+            exclude: vec![],
+            prefix: String::new(),
+            max_description_chars: 1000,
+            call_timeout_ms: 10_000,
+            agent_context: false,
+        };
+        Some((server, tool.mcp_name.clone()))
+    }
+
     pub async fn match_tools(&self, patterns: &[String], tenant: &str) -> Vec<String> {
         if patterns.is_empty() {
             return Vec::new();
