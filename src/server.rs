@@ -176,6 +176,33 @@ const CAPABILITIES: [&str; 7] = [
 fn usage_value((input, output): (u64, u64)) -> Value {
     json!({"input":input,"output":output,"cacheRead":0,"cacheWrite":0,"totalTokens":input+output})
 }
+/// As agent-pi's `session.update`, which names a title and a pin. This store keeps both in the session's metadata,
+/// where `session.list` and `session.get` already report them. None when the request names neither.
+fn named_changes(params: &Value, current: &Value) -> Result<Option<Value>, &'static str> {
+    let (title, pinned) = (params.get("title"), params.get("pinned"));
+    if title.is_none() && pinned.is_none() {
+        return Ok(None);
+    }
+    let mut metadata = params.get("metadata").cloned().unwrap_or_else(|| current.clone());
+    if !metadata.is_object() {
+        metadata = json!({});
+    }
+    if let Some(title) = title {
+        match title.as_str() {
+            Some(text) if text.chars().count() <= MAX_TITLE_CHARS => metadata["title"] = json!(text),
+            _ => return Err("title must be at most 200 characters"),
+        }
+    }
+    if let Some(pinned) = pinned {
+        if !pinned.is_boolean() {
+            return Err("pinned must be a boolean");
+        }
+        metadata["pinned"] = pinned.clone();
+    }
+    Ok(Some(metadata))
+}
+/// agent-pi's limit on a title.
+const MAX_TITLE_CHARS: usize = 200;
 fn session_value(s: Session) -> Value {
     let parked = s.parked;
     let mut v = serde_json::to_value(s).unwrap();
@@ -1111,7 +1138,18 @@ async fn rpc(host: Arc<Host>, name: Option<String>, headers: HeaderMap, body: By
                 result
             })
         }
-        "session.update" => agent.store.update(&s, &session_id, r.params["name"].as_str().map(str::to_owned), r.params.get("metadata").cloned(), false).await.map(session_value),
+        "session.update" => {
+            let current = match agent.store.state(&s, &session_id).await {
+                Ok(state) => state.session.metadata,
+                Err(e) => return storage(e),
+            };
+            let metadata = match named_changes(&r.params, &current) {
+                Ok(Some(merged)) => Some(merged),
+                Ok(None) => r.params.get("metadata").cloned(),
+                Err(message) => return fail(StatusCode::BAD_REQUEST, message),
+            };
+            agent.store.update(&s, &session_id, r.params["name"].as_str().map(str::to_owned), metadata, false).await.map(session_value)
+        }
         "session.close" => {
             let res = agent.store.update(&s, &session_id, None, None, true).await.map(|_| json!({"closed":true}));
             if res.is_ok() {
@@ -1813,4 +1851,20 @@ pub async fn start(config: HostConfig) -> Result<(), Box<dyn Error>> {
     }
     drop(host);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_title_or_pin_merges_into_the_metadata() {
+        let current = json!({"title": "Voice conversation", "skillDraft": "x"});
+        assert_eq!(named_changes(&json!({"title": "Book a room"}), &current), Ok(Some(json!({"title": "Book a room", "skillDraft": "x"}))));
+        assert_eq!(named_changes(&json!({"pinned": true}), &current), Ok(Some(json!({"title": "Voice conversation", "skillDraft": "x", "pinned": true}))));
+        assert_eq!(named_changes(&json!({"metadata": {"a": 1}}), &current), Ok(None));
+        assert!(named_changes(&json!({"title": 3}), &current).is_err());
+        assert!(named_changes(&json!({"title": "x".repeat(201)}), &current).is_err());
+        assert!(named_changes(&json!({"pinned": "yes"}), &current).is_err());
+    }
 }
