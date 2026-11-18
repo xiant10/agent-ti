@@ -1737,6 +1737,7 @@ pub fn router(host: Arc<Host>) -> Router {
             post(rpc_named).get(events_named).delete(close_named),
         )
         .layer(DefaultBodyLimit::max(limit))
+        .merge(crate::docs::router())
         .with_state(host)
 }
 /// Loads every agent and serves them until SIGTERM. Running steps get a deadline to finish; the

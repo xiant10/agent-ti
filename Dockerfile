@@ -4,6 +4,12 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY src ./src
+# Carried in the binary by build.rs and served at /docs/mcp. .dockerignore leaves out docs/records.
+COPY build.rs ./
+COPY docs ./docs
+# The commit the image was built from, which /docs/mcp reports.
+ARG VERSION=unknown
+ENV VERSION=${VERSION}
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo clean --release -p agent-ti -p agent-ti-config \

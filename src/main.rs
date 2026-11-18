@@ -44,6 +44,8 @@ async fn run(
 ) -> Result<(), Box<dyn Error>> {
     match (args.first().map(String::as_str), host) {
         (Some("serve"), Some(host)) => agent_ti::server::start(host).await?,
+        // Only /docs/mcp, for the workspace's docs contract suite.
+        (Some("docs"), _) if args.len() == 2 => agent_ti::docs::serve_only(&args[1]).await?,
         (Some("check"), Some(host)) => {
             let client = reqwest::Client::new();
             for agent in agent_ti::agents::load_all(&host, &client).await? {
@@ -56,7 +58,7 @@ async fn run(
                 );
             }
         }
-        _ => return Err("usage: agent-ti serve <host.json> | check <host.json>".into()),
+        _ => return Err("usage: agent-ti serve <host.json> | check <host.json> | docs <addr>".into()),
     }
     Ok(())
 }
