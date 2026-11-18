@@ -1,3 +1,11 @@
+---
+title: "agent-ti API"
+audience: consumer
+kind: reference
+status: current
+summary: "What agent-ti serves beyond agent-pi's protocol: several agents per process, greeting methods, metrics and errors."
+---
+
 # agent-ti API
 
 The reference for calling agent-ti. It serves the agent contract in the t10 workspace's [`contracts/agent/README.md`](../../contracts/agent/README.md), and its methods, events and params are agent-pi's, so agent-pi's [`docs/api.md`](https://github.com/xiant10/agent-pi/blob/main/docs/api.md) is the reference for them. This page covers what differs: several agents in one process, the greeting methods, metrics and errors. [`design.md`](design.md#what-differs-from-agent-pi) lists every difference with its reason, [`configuration.md`](configuration.md) the host and agent files, and [`greeting.md`](greeting.md) the greeting in full.

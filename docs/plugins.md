@@ -1,6 +1,14 @@
+---
+title: "Plugins"
+audience: contributor
+kind: design
+status: current
+summary: "agent-ti's plugin hooks, following agent-pi's hook list."
+---
+
 # Plugins
 
-Status: revised 2026-11-05. The hook list is agent-pi's ([`plugins/types.ts`](../../agent-pi/packages/agent-pi/src/plugins/types.ts), [lifecycle](../../agent-pi/docs/lifecycle.md)). What the code has today is in the [plan](implementation-plan.md#current-code-against-the-design).
+Status: revised 2026-11-05. The hook list is agent-pi's ([`plugins/types.ts`](../../agent-pi/packages/agent-pi/src/plugins/types.ts), [lifecycle](../../agent-pi/docs/lifecycle.md)). What the code has today is in the [plan](records/implementation-plan.md#current-code-against-the-design).
 
 ## Shape
 

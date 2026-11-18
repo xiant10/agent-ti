@@ -1,3 +1,11 @@
+---
+title: "Validation record"
+audience: contributor
+kind: record
+status: record
+summary: "Test runs of agent-ti worth keeping, newest last."
+---
+
 # Validation record
 
 Test runs worth keeping, newest last. The [plan](implementation-plan.md) says what is built and what is still open; a run here shows only what was checked that day.
@@ -34,13 +42,13 @@ The HTTP smoke checks signature/audience/expiry/scope rejection; tenant, user an
 
 Kubernetes ConfigMap files are projected symlinks. The tested deployment stages them into regular-file snapshots in an init container before bundle validation. Docker builds explicitly clean workspace crates in the target cache so changed local sources cannot reuse a stale binary; third-party build artifacts remain cached.
 
-The test namespace and PVC were left running for inspection. Port-forwards were stopped automatically. No gateway route was registered for agent-ti and no existing platform deployment was reapplied by these tests. The base/Compose files and scripts are described in the [deployment guide](../deploy/README.md).
+The test namespace and PVC were left running for inspection. Port-forwards were stopped automatically. No gateway route was registered for agent-ti and no existing platform deployment was reapplied by these tests. The base/Compose files and scripts are described in the [deployment guide](../../deploy/README.md).
 
 These runs predate the switch to agent-pi's design. They don't cover live text, the hook list beyond `before_prompt`, grants, steering, or any capacity numbers.
 
 ## 2026-11-05: platform picker
 
-Ti Assistant was deployed in the live `t10` namespace as `agent-ti-0` using `t10/agent-ti:picker` ([setup](../../t10-agents/docs/ti.md), then in agent-ti), with real auth-server tokens and the configured LLM gateway.
+Ti Assistant was deployed in the live `t10` namespace as `agent-ti-0` using `t10/agent-ti:picker` ([setup](../../../t10-agents/docs/ti.md), then in agent-ti), with real auth-server tokens and the configured LLM gateway.
 
 - The first direct provider reply was `Ti is ready.`.
 - Normal platform drafts published catalog revisions 40–42. The default stayed `assistant` and its three replicas were preserved; re-running registration changed nothing. The gateway's authenticated `agents.list` includes `{name: "ti", title: "Ti Assistant"}`, and Acme, Sample Acme and Sample Globex members can select it.
@@ -421,7 +429,7 @@ Not measured, so still starting values: `maxSessionsPerTenant`, `maxParallelTool
 | Contract | agent-ti and agent-pi, 20 of 20 |
 | Local cluster, namespace `t10` | `t10/agent-ti:ops`, same instance ID, `/metrics` answers. Its host ConfigMap wasn't re-applied, so it keeps 16 runs per tenant and 1,000 streams until the overlay is |
 
-Found while doing it: `before_tool_call` errors were swallowed, so a failing security hook let the call through, against [plugins.md](plugins.md); it now refuses. The contract suite registered `after(rmSync(data))` inside `before`, and `node:test` runs that when the hook ends, so it deleted the harness's storage during the tests. One open connection survives that and a pool can't, so the suite now removes it at the end (agent-pi passes either way). `scripts/test-replicas-k8s.sh`'s first version left port-forwards running.
+Found while doing it: `before_tool_call` errors were swallowed, so a failing security hook let the call through, against [plugins.md](../plugins.md); it now refuses. The contract suite registered `after(rmSync(data))` inside `before`, and `node:test` runs that when the hook ends, so it deleted the harness's storage during the tests. One open connection survives that and a pool can't, so the suite now removes it at the end (agent-pi passes either way). `scripts/test-replicas-k8s.sh`'s first version left port-forwards running.
 
 Not tested: `before_tool_call` refusing end to end (no plugin in the smoke fails), the retention job on its hourly timer (`prune` itself is tested), retention or backups on the cluster, and `/metrics` being scraped: nothing on the platform collects Prometheus metrics yet, as `ARCHITECTURE.md` notes.
 
@@ -442,7 +450,7 @@ Spend is now added in the transaction that records each model call, not when the
 
 ## 2026-11-10: tenant customization (tenant agents step A3)
 
-`tenantConfig` and the instruction slot, built for step A3 of [`t10-agent-control/docs/tenant-agents.md`](../../t10-agent-control/docs/tenant-agents.md). `cargo test --workspace` passes, with `tests/tenant_config.rs` and the unit tests in `src/tenant_config.rs`: tool lists by owning module with `on` winning and `keepTools` kept, the tenant's text at the slot and the call text on a speaking profile, the model recorded at creation and dropped when the agent no longer has it, drafts per author, and the last good copy kept through an outage.
+`tenantConfig` and the instruction slot, built for step A3 of [`t10-agent-control/docs/tenant-agents.md`](../../../t10-agent-control/docs/tenant-agents.md). `cargo test --workspace` passes, with `tests/tenant_config.rs` and the unit tests in `src/tenant_config.rs`: tool lists by owning module with `on` winning and `keepTools` kept, the tenant's text at the slot and the call text on a speaking profile, the model recorded at creation and dropped when the agent no longer has it, drafts per author, and the last good copy kept through an outage.
 
 On namespace `t10`, with preview images of control, the tool gateway, the property app, agent-ti and the agents image, `ti`'s pool claiming `tenant_config` and `tools_via_gateway` and hosting `property` under `agent-ti-property`, `scripts/tenant-config-cluster.mjs` with `qwen3.5-flash`, four runs:
 

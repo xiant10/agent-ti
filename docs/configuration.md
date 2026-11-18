@@ -1,6 +1,14 @@
+---
+title: "Configuration"
+audience: consumer
+kind: reference
+status: current
+summary: "agent-ti configuration: agent-pi's agent.json plus a host file, read through config sources."
+---
+
 # Configuration
 
-Status: revised 2026-11-05. This describes the target: agent-pi's `agent.json` format plus a small host file, read through config sources. What is built is in the [plan](implementation-plan.md).
+Status: revised 2026-11-05. This describes the target: agent-pi's `agent.json` format plus a small host file, read through config sources. What is built is in the [plan](records/implementation-plan.md).
 
 ## Two kinds of file
 
@@ -146,7 +154,7 @@ agent-ti reads an unmodified agent-pi `agent.json`. The same file runs on both r
 }
 ```
 
-Field meanings are agent-pi's (see its [developer guide](../../agent-pi/docs/developer-guide.md) and `config.ts`). Paths such as `file`, `skillsDir` and `faqFile` are relative to the agent file within its snapshot. How agent-ti treats each group:
+Field meanings are agent-pi's (see its [developer guide](../../agent-pi/docs/guides/developer-guide.md) and `config.ts`). Paths such as `file`, `skillsDir` and `faqFile` are relative to the agent file within its snapshot. How agent-ti treats each group:
 
 | Fields | agent-ti |
 |---|---|
