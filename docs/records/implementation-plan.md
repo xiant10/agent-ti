@@ -1,6 +1,14 @@
+---
+title: "Implementation plan"
+audience: contributor
+kind: record
+status: record
+summary: "agent-ti's build plan and status as of its last revision."
+---
+
 # Implementation plan
 
-Status: revised 2026-11-05, when the design was changed to follow agent-pi (see [design.md](design.md)); the fix-now list and steps 1–7 were done the same day, and step 8's speech, voice profile and `note` that evening. This is the one document that tracks build status; the design documents describe only the target.
+Status: revised 2026-11-05, when the design was changed to follow agent-pi (see [design.md](../design.md)); the fix-now list and steps 1–7 were done the same day, and step 8's speech, voice profile and `note` that evening. This is the one document that tracks build status; the design documents describe only the target.
 
 ## Built
 
@@ -31,7 +39,7 @@ Where today's code falls short of, or departs from, the design. Each is closed b
 | Live text | A run re-done after a crash streams under a new `generationId` but doesn't first mark the cut-off reply aborted | Open; listed under step 8, not done with it |
 | A plugin's reply to a busy session | Queued as a command and placed when the session's earlier work ends, instead of waiting in the inbox for the next turn boundary | Open; listed under step 4, not done with it |
 | Auth | ES256/RS256 and the `authenticate` hook; no static-token authenticator or HMAC | Port of agent-pi's `auth/` |
-| Tenant connectors | The split agent-pi runs today: published schemas from control's `GET /v1/runtime/connectors`, calls to the gateway's `/mcp/connector/{id}`. The design's `perTenant` server at `/mcp/tenant` waits on the gateway and agent-pi ([order of work](../../t10-agent-control/docs/tenant-connectors.md#order-of-work)) | `perTenant`, after the gateway serves `/mcp/tenant` |
+| Tenant connectors | The split agent-pi runs today: published schemas from control's `GET /v1/runtime/connectors`, calls to the gateway's `/mcp/connector/{id}`. The design's `perTenant` server at `/mcp/tenant` waits on the gateway and agent-pi ([order of work](../../../t10-agent-control/docs/tenant-connectors.md#order-of-work)) | `perTenant`, after the gateway serves `/mcp/tenant` |
 | Voice through `t10-livekit-agent` | agent-ti speaks the protocol, but voice tokens are minted for `agent-pi` and `agent-sales` only, and agent-ti accepts `t10`. Since 2026-11-11 a submission's ID is a number (its admission order), as agent-pi's is, and a streamed `POST` ends with the JSON-RPC result when its run settles. Before that the worker failed on a UUID `Agent-Submission-Id` and a stream that never ended. Tried only with `curl` against the Compose stack, not a call | An `agent-ti` audience on voice grants (auth-server), then re-registration with the `voice` capability, then a real call |
 | Flows: the `flow-runner` plugin | Not ported, so an agent that names it stops at startup. From config it does nothing in agent-pi either (it needs `callTool` from code), and no app uses it | When an agent needs one |
 | Sub-agents and tasks | A parent's tool polls the child's outcome (20–250 ms) rather than being woken | When it shows up in a measurement |
@@ -59,7 +67,7 @@ The review's fix-now list, done with step 1 on 2026-11-05:
 
 | Step | Work | agent-pi source | Done when |
 |---|---|---|---|
-| 1 ✓ | The `ConfigSource` abstraction and its `file` source; load an unmodified agent-pi `agent.json` plus the host file, with the field rules in [configuration.md](configuration.md#agent-file); `bundle` as the session's config version; one SQLite file per agent and an in-memory scheduler; retire bundles, bindings, resources, revision publishing and `generate-deploy.py`; tenant access from the platform catalog | `config.ts`, `apps/assistant/config/agent.json` | The assistant's `agent.json`, unchanged, starts on agent-ti; nothing outside the config source opens a config file; deploy configs are plain files |
+| 1 ✓ | The `ConfigSource` abstraction and its `file` source; load an unmodified agent-pi `agent.json` plus the host file, with the field rules in [configuration.md](../configuration.md#agent-file); `bundle` as the session's config version; one SQLite file per agent and an in-memory scheduler; retire bundles, bindings, resources, revision publishing and `generate-deploy.py`; tenant access from the platform catalog | `config.ts`, `apps/assistant/config/agent.json` | The assistant's `agent.json`, unchanged, starts on agent-ti; nothing outside the config source opens a config file; deploy configs are plain files |
 | 1a ✓ | The `http` source: snapshot API, token auth, last-good cache on the volume | — | An agent loads from a fixture config API, and restarts from the cache with the API down |
 | 2 ✓ | Live text: deltas published from memory at most every 100 ms and not committed, a per-session delta ring, partial text in snapshots | `events/hub.ts`, `events/mapper.ts` | Workbench shows text as it arrives; resume mid-reply shows the partial text |
 | 2a ✓ | Measure: the same `t10-perf` text scenario against agent-pi and agent-ti, memory and time to first token at rising concurrency | — | Both results are in [validation.md](validation.md); if agent-ti isn't clearly better, revisit the plan before step 3 |
@@ -67,7 +75,7 @@ The review's fix-now list, done with step 1 on 2026-11-05:
 | 4 ✓ | `session.steer`, `session.interrupt` (with `duringTools`), `session.retry`, `whenBusy`, the session inbox | `service.ts` | Barge-in and steer behave as agent-pi's `flow.test.ts` and `agent.test.ts` describe |
 | 5 ✓ | Tool catalog, active set, `load_skill`, `search_tools` (BM25), preload, eviction, `tools.active` events; agent-pi skill files | `tools/catalog.ts`, `activation.ts`, `skills/skills.ts` | The assistant's `skills/` work unchanged |
 | 6 ✓ | Grants from auth-server for `auth: "grant"` MCP servers; Streamable HTTP MCP with `list_changed`; collab and knowledge connected | `auth/grants.ts`, `mcp/manager.ts` | A collab tool runs as the user, and continues after a restart with the user offline |
-| 7 ✓ (cluster-checked) | Tenant skills from `t10-agent-control` (ETag cache, change feed); tenant connectors as a `perTenant` grant MCP server at the gateway's `/mcp/tenant` ([design](../../t10-agent-control/docs/tenant-connectors.md#control-gateway-and-harness)) | `skills/tenant.ts`, agent-pi's `perTenant` server | A skill published in Workbench reaches the next turn; two tenants' connectors never mix |
+| 7 ✓ (cluster-checked) | Tenant skills from `t10-agent-control` (ETag cache, change feed); tenant connectors as a `perTenant` grant MCP server at the gateway's `/mcp/tenant` ([design](../../../t10-agent-control/docs/tenant-connectors.md#control-gateway-and-harness)) | `skills/tenant.ts`, agent-pi's `perTenant` server | A skill published in Workbench reaches the next turn; two tenants' connectors never mix |
 | 8 (part) | Profiles in full, `speech` events, `note`, the `voice` capability; voice through `t10-livekit-agent` | `events/speech.ts`, `events/mapper.ts`, `agent/profiles.ts` | A voice call works on a `voice` profile. Done: the contract's voice case and a `voice` turn on the cluster; open: the call itself (above) |
 | 9 ✓ | Compaction in place of the eight-turn window | pi-durable `harness/compaction.js`, `generation.js` | A long session keeps a stable request size |
 | 10a ✓ | `consult_expert` and sub-agents as child sessions | `docs/delegation.md`, `agent/subagents.ts`, `core-extension.ts` | A sub-agent and the expert answer as children; cancel and restart behave as the delegation doc says |
@@ -82,8 +90,8 @@ Steps 1–7 and 9–12 are done (2026-11-05); step 7 was also checked on the loc
 
 ## Testing
 
-- Port agent-pi's tests as each feature lands. The behavior they describe is the specification; a Rust test that disagrees with agent-pi needs a reason in the design's [differences table](design.md#what-differs-from-agent-pi).
-- A scripted model and MCP fixture, as agent-pi's [mock model](../../agent-pi/docs/mock-model.md) (`scripts/fixture.mjs` today).
+- Port agent-pi's tests as each feature lands. The behavior they describe is the specification; a Rust test that disagrees with agent-pi needs a reason in the design's [differences table](../design.md#what-differs-from-agent-pi).
+- A scripted model and MCP fixture, as agent-pi's [mock model](../../../agent-pi/docs/guides/mock-model.md) (`scripts/fixture.mjs` today).
 - Keep the crash tests: kill the real process during a model call, after a tool's prepared record (both in `scripts/test-local.mjs` and `scripts/test-k8s.sh`), and after the final commit (not yet scripted).
 - Run `node contracts/agent/conformance.ts agent-ti` from the workspace, and the Workbench browser test (`AGENT_TI_E2E=1`) against a real model.
 - Record each run worth keeping in [validation.md](validation.md).

@@ -17,9 +17,9 @@ Design (the target):
 
 Work and operation:
 
-- [Implementation plan](docs/implementation-plan.md): what is built, how the code differs from the design, what to fix, what to port next
+- [Implementation plan](docs/records/implementation-plan.md): what is built, how the code differs from the design, what to fix, what to port next
 - [Deployment](deploy/README.md): Compose and Kubernetes test environments
-- [Validation record](docs/validation.md): test runs and their results
+- [Validation record](docs/records/validation.md): test runs and their results
 
 ## Build and verify
 

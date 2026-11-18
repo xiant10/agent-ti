@@ -1,6 +1,14 @@
+---
+title: "agent-ti design"
+audience: contributor
+kind: design
+status: current
+summary: "The target design of agent-ti, agent-pi's runtime in Rust."
+---
+
 # agent-ti design
 
-Status: revised 2026-11-05. This document describes the target. What the code does today, and how it falls short of this, is in [implementation-plan.md](implementation-plan.md).
+Status: revised 2026-11-05. This document describes the target. What the code does today, and how it falls short of this, is in [implementation-plan.md](records/implementation-plan.md).
 
 agent-ti is agent-pi written in Rust. It copies agent-pi's design: the protocol, configuration format, plugin hooks, skills and tool loading, grants, and voice output. Read this alongside agent-pi's [design](../../agent-pi/docs/design.md) and [lifecycle](../../agent-pi/docs/lifecycle.md). When this document doesn't say otherwise, agent-pi's behavior is the specification.
 
@@ -45,7 +53,7 @@ Everything not in this table should behave as agent-pi does. A new difference ne
 
 ## Requirements
 
-agent-pi's requirements, unchanged. Build status for each is in the [plan](implementation-plan.md).
+agent-pi's requirements, unchanged. Build status for each is in the [plan](records/implementation-plan.md).
 
 | # | Requirement | agent-pi source |
 |---|---|---|
@@ -200,7 +208,7 @@ The 2026-11-05 review settled these; the sections above carry the result.
 3. Each agent has its own SQLite file, even when several agents share a process.
 4. agent-ti reads an unmodified agent-pi `agent.json` ([configuration.md](configuration.md#agent-file)).
 5. A session records its agent's `bundle` version, as agent-pi does.
-6. agent-ti's memory and latency are measured against agent-pi after live text lands, before the larger ports ([plan](implementation-plan.md), step 2a).
+6. agent-ti's memory and latency are measured against agent-pi after live text lands, before the larger ports ([plan](records/implementation-plan.md), step 2a).
 
 Also decided that day: all configuration is read through one config-source abstraction, local files or a remote API ([configuration.md](configuration.md#config-sources)).
 

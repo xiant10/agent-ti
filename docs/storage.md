@@ -1,6 +1,14 @@
+---
+title: "Storage and recovery"
+audience: contributor
+kind: design
+status: current
+summary: "agent-ti's SQLite storage and recovery: no lost input, resumed runs, reused results, resumable streams."
+---
+
 # Storage and recovery
 
-Status: revised 2026-11-05. SQLite only. This is the part of agent-ti that replaces pi-durable, so it has to give the guarantees agent-pi gets from it: accepted input is never lost, a restarted process continues unfinished runs, a recorded model or tool result is reused rather than repeated, and event streams resume. What the code has today is in the [plan](implementation-plan.md#current-code-against-the-design).
+Status: revised 2026-11-05. SQLite only. This is the part of agent-ti that replaces pi-durable, so it has to give the guarantees agent-pi gets from it: accepted input is never lost, a restarted process continues unfinished runs, a recorded model or tool result is reused rather than repeated, and event streams resume. What the code has today is in the [plan](records/implementation-plan.md#current-code-against-the-design).
 
 ## Store
 
@@ -102,4 +110,4 @@ Each step the supervisor takes is one transaction, and every message has a reque
 
 ## Connections
 
-One writer connection and four read-only ones per store. Under WAL, readers don't wait for the writer or each other, and they see every committed transaction. Commits still go one at a time, which is what bounds a store's throughput (see the [measurements](validation.md#2026-11-05-step-12-operations)).
+One writer connection and four read-only ones per store. Under WAL, readers don't wait for the writer or each other, and they see every committed transaction. Commits still go one at a time, which is what bounds a store's throughput (see the [measurements](records/validation.md#2026-11-05-step-12-operations)).

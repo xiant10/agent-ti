@@ -1,3 +1,11 @@
+---
+title: "Acknowledgements and progress"
+audience: consumer
+kind: design
+status: current
+summary: "Acknowledgements and progress: what agent-ti says while a turn is still working, and how to configure it."
+---
+
 # Acknowledgements and progress
 
 Status: built 2026-11-12 (`src/progress.rs`, the hub in `src/events.rs`, config in `crates/agent-ti-config`). The voice worker's part is not built yet. Where the build differs from this design, it says so below.

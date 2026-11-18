@@ -1,3 +1,11 @@
+---
+title: "Call greeting and context variables"
+audience: consumer
+kind: design
+status: current
+summary: "How an agent speaks first on a call, and the context variables a caller passes for it."
+---
+
 # Call greeting and context variables
 
 Status: built 2026-11-12 on `feat/call-greeting` branches, not committed. Tested with unit and end-to-end tests; previews on the local cluster.
@@ -23,7 +31,7 @@ caller's mic track subscribed (t10-livekit-agent)
 ```
 
 - **agent-ti owns the greeting.** It knows the persona, the tenant's settings, the caller's language and the transcript, and it writes the greeting into the conversation, so the model sees it next turn and chat shows it.
-- **The voice worker asks and speaks.** It never composes the greeting except as a local fallback when agent-ti can't answer (`VOICE_GREETING`). See [`t10-livekit-agent/docs/GREETING.md`](../../t10-livekit-agent/docs/GREETING.md).
+- **The voice worker asks and speaks.** It never composes the greeting except as a local fallback when agent-ti can't answer (`VOICE_GREETING`). See [`t10-livekit-agent/docs/greeting.md`](../../t10-livekit-agent/docs/greeting.md).
 - **There is no general "say" method.** A caller holding a grant could otherwise put assistant messages of their own into a transcript. `session.greet` writes only text the server produced.
 
 ## Configuration
