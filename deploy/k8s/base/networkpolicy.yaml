@@ -12,4 +12,6 @@ spec:
         # The voice app finds a session's replica by its ID and calls it directly.
         - podSelector: {matchLabels: {app.kubernetes.io/name: t10-livekit-agent}}
         - podSelector: {matchLabels: {app.kubernetes.io/name: agent-ti-test}}
+        # t10-docs reads /docs/mcp, which takes no token. Every other route still needs one.
+        - podSelector: {matchLabels: {app.kubernetes.io/name: t10-docs}}
       ports: [{port: 18120, protocol: TCP}]
