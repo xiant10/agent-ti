@@ -79,3 +79,7 @@ A JSON-RPC error `{"jsonrpc": "2.0", "id": …, "error": {"code", "message"}}` w
 | 422 | `-32022` | Refused |
 | 429 | `-32029` | Over a tenant, user or capacity limit. `Retry-After: 1` |
 | 503 | `-32603` | Storage or a dependency unavailable. `Retry-After: 1` |
+
+## Docs for coding agents
+
+`POST /docs/mcp` serves this repo's docs for people building on t10, over MCP and with no token, as the workspace's [docs contract](../../contracts/docs/README.md) describes. `agent-ti docs <addr>` serves only that route, for the contract's suite.

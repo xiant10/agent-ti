@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod children;
 pub mod compaction;
 pub mod control_copy;
+pub mod docs;
 pub mod events;
 pub mod flights;
 pub mod flow;
