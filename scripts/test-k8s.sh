@@ -4,8 +4,8 @@ set -eu
 cd "$(dirname "$0")/.."
 context=${AGENT_TI_KUBE_CONTEXT:-docker-desktop}
 image=${AGENT_TI_IMAGE:-t10/agent-ti:dev}
-if [ "$image" != "t10/agent-ti:dev" ]; then
-  echo 'This local smoke overlay expects t10/agent-ti:dev.' >&2
+if [ "$image" != "agent-ti:dev" ]; then
+  echo 'This local smoke overlay expects agent-ti:dev.' >&2
   exit 2
 fi
 artifact_dir=$(mktemp -d "${TMPDIR:-/tmp}/agent-ti-k8s.XXXXXX")

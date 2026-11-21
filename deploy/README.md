@@ -15,7 +15,7 @@ From the agent-ti directory:
 
 ```sh
 cargo build --locked
-docker build -t t10/agent-ti:dev .
+docker build -t agent-ti:dev .
 ```
 
 The image builds from this repository only. The Docker target cache retains third-party dependencies and rebuilds workspace crates when a source layer changes.

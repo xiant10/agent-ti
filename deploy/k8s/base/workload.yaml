@@ -34,7 +34,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: agent-ti
-          image: t10/agent-ti:dev
+          image: agent-ti:dev
           imagePullPolicy: IfNotPresent
           args: [serve, /etc/agent-ti/host/agent-ti.json]
           ports: [{name: http, containerPort: 18120}]

@@ -43,7 +43,7 @@ node contracts/agent/conformance.ts agent-ti
 The local test runs the smoke against a real child process, kills it with SIGKILL during a model call and again during an unsafe tool call, and checks recovery. Kubernetes tests repeat that against the container and PVC:
 
 ```sh
-docker build -t t10/agent-ti:dev .
+docker build -t agent-ti:dev .
 ./scripts/test-k8s.sh
 ```
 
