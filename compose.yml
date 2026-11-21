@@ -1,6 +1,6 @@
 services:
   agent-ti:
-    image: t10/agent-ti:dev
+    image: agent-ti:dev
     build: .
     # The smoke overlay's host file and agents, with the fixture under its Compose name.
     command: [serve, /etc/agent-ti/host/agent-ti.json]
